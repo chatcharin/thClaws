@@ -79,10 +79,10 @@ impl Default for ReadyGate {
 /// worker's event bus. It implements `MessageHandler` so incoming
 /// Telegram messages can be pushed into `ShellInput::TelegramMessage`
 /// and drive agent turns identically to LINE messages.
-#[derive(Debug)]
 pub struct TelegramWorkerHandler {
     events_tx: tokio::sync::broadcast::Sender<ViewEvent>,
     input_tx_self: std::sync::mpsc::Sender<ShellInput>,
+    approver: Option<std::sync::Arc<crate::telegram::TelegramApprover>>,
 }
 
 impl crate::telegram::handler::MessageHandler for TelegramWorkerHandler {
@@ -105,6 +105,26 @@ impl crate::telegram::handler::MessageHandler for TelegramWorkerHandler {
             }
             // Notify UI that Telegram is active
             let _ = events_tx.send(ViewEvent::TelegramStatus(Ok(true)));
+        })
+    }
+
+    fn on_callback_query(
+        &self,
+        chat_id: i64,
+        data: String,
+        _from: Option<crate::telegram::protocol::User>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        let approver = self.approver.clone();
+        Box::pin(async move {
+            // Try to resolve as approval callback first
+            if let Some(approver) = &approver {
+                if let Some(_decision) = approver.record_decision_from_callback(&data) {
+                    eprintln!("[Telegram] Approval resolved via callback: {}", data);
+                    return;
+                }
+            }
+            // Not an approval callback — treat as regular callback
+            eprintln!("[Telegram] Unhandled callback query: {}", data);
         })
     }
 }
@@ -633,6 +653,9 @@ pub struct WorkerState {
     /// Plan-07 Phase 3: pre-Telegram-connect snapshot of the agent's
     /// permission mode, so TelegramDisconnect can restore.
     pub telegram_pre_mode: Option<crate::permissions::PermissionMode>,
+    /// Plan-07 Phase 3: Telegram approver for routing tool approvals
+    /// to inline keyboard buttons.
+    pub telegram_approver: Option<std::sync::Arc<crate::telegram::TelegramApprover>>,
     /// Plan-07 Phase 3: Telegram bridge cancel sender. When
     /// TelegramDisconnect fires, this sender is used to signal the
     /// polling loop task to stop.
@@ -1569,6 +1592,7 @@ async fn run_worker(
         line_pre_mode: None,
         line_pre_approver: None,
         telegram_pre_mode: None,
+        telegram_approver: None,
         telegram_poll_tx: None,
     };
 
@@ -2150,6 +2174,14 @@ async fn run_worker(
                         crate::permissions::set_current_mode_and_broadcast(
                             crate::permissions::PermissionMode::TelegramGated,
                         );
+                        
+                        // Create TelegramApprover for inline keyboard approvals
+                        let telegram_approver = std::sync::Arc::new(
+                            crate::telegram::TelegramApprover::new(None)
+                        );
+                        state.telegram_approver = Some(telegram_approver.clone());
+                        state.approver = telegram_approver as std::sync::Arc<dyn crate::permissions::ApprovalSink>;
+                        
                         if let Err(e) = state.rebuild_agent(true) {
                             eprintln!("[Telegram] rebuild_agent after mode swap failed: {e}");
                         }
@@ -2161,6 +2193,7 @@ async fn run_worker(
                         let handler = TelegramWorkerHandler {
                             events_tx: events_tx.clone(),
                             input_tx_self: input_tx_self.clone(),
+                            approver: state.telegram_approver.clone(),
                         };
                         if let Err(e) = bridge.start(handler).await {
                             eprintln!("[Telegram] Failed to start polling: {}", e);
@@ -2199,6 +2232,12 @@ async fn run_worker(
                 if let Some(prev_mode) = state.telegram_pre_mode.take() {
                     crate::permissions::set_current_mode_and_broadcast(prev_mode);
                     state.agent.permission_mode = prev_mode;
+                }
+                // Clear the TelegramApprover
+                state.telegram_approver = None;
+                // Restore the previous approver (from LINE or local)
+                if let Some(prev_approver) = state.line_pre_approver.take() {
+                    state.approver = prev_approver;
                 }
                 if let Err(e) = state.rebuild_agent(true) {
                     eprintln!("[Telegram] rebuild_agent after disconnect failed: {e}");

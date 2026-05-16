@@ -116,21 +116,6 @@ impl TelegramClient {
         Ok(updates)
     }
 
-    /// Call `answerCallbackQuery`.
-    pub async fn answer_callback_query(
-        &self,
-        request: AnswerCallbackQueryRequest,
-    ) -> Result<bool, String> {
-        let url = format!("{}/answerCallbackQuery", self.base_url);
-        let resp = self.client.post(&url)
-            .json(&request)
-            .send()
-            .await
-            .map_err(|e| format!("answerCallbackQuery request failed: {}", e))?;
-
-        Ok(resp.status().is_success())
-    }
-
     /// Call `setMyCommands` to register bot commands that appear
     /// when users type `/` in the chat.
     pub async fn set_my_commands(
@@ -159,5 +144,40 @@ impl TelegramClient {
         data.get("ok")
             .and_then(|v| v.as_bool())
             .ok_or("setMyCommands: no ok field".to_string())
+    }
+
+    /// Answer a callback query from inline keyboard button press.
+    /// This removes the loading state on the button and optionally
+    /// shows a notification to the user.
+    pub async fn answer_callback_query(
+        &self,
+        callback_query_id: &str,
+        text: &str,
+        show_alert: bool,
+    ) -> Result<bool, String> {
+        let url = format!("{}/answerCallbackQuery", self.base_url);
+        let request = crate::telegram::protocol::AnswerCallbackQueryRequest {
+            callback_query_id: callback_query_id.to_string(),
+            text: text.to_string(),
+            show_alert: Some(show_alert),
+        };
+        let resp = self.client.post(&url)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| format!("answerCallbackQuery request failed: {}", e))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("answerCallbackQuery failed: {} - {}", status, body));
+        }
+
+        let data: serde_json::Value = resp.json().await
+            .map_err(|e| format!("answerCallbackQuery parse error: {}", e))?;
+
+        data.get("ok")
+            .and_then(|v| v.as_bool())
+            .ok_or("answerCallbackQuery: no ok field".to_string())
     }
 }

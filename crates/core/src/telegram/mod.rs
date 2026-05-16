@@ -12,6 +12,9 @@ pub mod protocol;
 pub mod client;
 pub mod polling;
 pub mod handler;
+pub mod approver;
+
+pub use approver::TelegramApprover;
 
 use config::TelegramConfig;
 use client::TelegramClient;
