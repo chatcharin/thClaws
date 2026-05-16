@@ -2604,10 +2604,7 @@ async fn run_worker(
                 }
                 
                 // Set up response collector (same as TelegramMessage)
-                let (event_tx, event_rx) = tokio::sync::broadcast::channel(128);
-                
                 // Subscribe to events before running the turn
-                events_tx.subscribe();
                 let mut event_rx_collector = events_tx.subscribe();
                 
                 let collector = tokio::spawn(async move {
