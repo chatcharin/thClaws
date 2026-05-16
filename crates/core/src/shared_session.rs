@@ -165,7 +165,7 @@ impl crate::telegram::handler::MessageHandler for TelegramWorkerHandler {
                 if let Err(e) = input_tx_self.send(ShellInput::TelegramMessage {
                     chat_id,
                     text: format!("[Photo] {}", text),
-                    from,
+                    from: from.clone(),
                 }) {
                     eprintln!("[Telegram] Failed to push photo message to worker: {}", e);
                 }
@@ -174,9 +174,9 @@ impl crate::telegram::handler::MessageHandler for TelegramWorkerHandler {
                 // the error will be caught and user will see a message
                 if let Err(e) = input_tx_self.send(ShellInput::TelegramMessageWithImages {
                     chat_id,
-                    text,
+                    text: text.clone(),
                     images,
-                    from,
+                    from: from.clone(),
                 }) {
                     eprintln!("[Telegram] Failed to push photo with images to worker: {}", e);
                     // Fallback to text
@@ -4801,22 +4801,25 @@ async fn download_image_as_base64(url: &str) -> Result<(String, String), String>
         return Err(format!("Failed to download image: HTTP {}", response.status()));
     }
     
-    // Get content type from response headers
+    // Get content type from response headers - clone to string immediately
+    // to avoid borrow checker issues with response.bytes()
     let content_type_header = response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("unknown");
+        .unwrap_or("unknown")
+        .to_string();
     
     eprintln!("[Telegram] Content-Type from header: {}", content_type_header);
+    
+    // Get bytes first (this consumes response)
+    let bytes = response.bytes().await.map_err(|e| e.to_string())?;
     
     // Detect actual image type from magic bytes (file signature)
     // JPEG: FF D8 FF
     // PNG: 89 50 4E 47
     // WebP: 52 49 46 46 ... 57 45 42 50
     // GIF: 47 49 46 38
-    let bytes = response.bytes().await.map_err(|e| e.to_string())?;
-    
     let detected_type = if bytes.len() >= 3 {
         if bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF {
             "image/jpeg"
@@ -4829,7 +4832,7 @@ async fn download_image_as_base64(url: &str) -> Result<(String, String), String>
         } else {
             // Unknown - trust the header or fallback
             if content_type_header.starts_with("image/") {
-                content_type_header
+                &content_type_header
             } else {
                 eprintln!("[Telegram] WARNING: Unknown image format, falling back to image/jpeg");
                 "image/jpeg"
