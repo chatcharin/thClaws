@@ -2145,6 +2145,12 @@ async fn run_worker(
                             let _ = events_tx.send(ViewEvent::TelegramStatus(Err(e)));
                         } else {
                             eprintln!("[Telegram] Polling started successfully");
+                            // Register bot commands for autocomplete
+                            if let Err(e) = bridge.register_commands().await {
+                                eprintln!("[Telegram] Failed to register commands: {}", e);
+                            } else {
+                                eprintln!("[Telegram] Bot commands registered");
+                            }
                             let _ = events_tx.send(ViewEvent::TelegramStatus(Ok(true)));
                         }
                     }
@@ -2171,6 +2177,66 @@ async fn run_worker(
             // Routes through the same agent turn pipeline as LINE messages
             // so the model responds identically regardless of source.
             ShellInput::TelegramMessage { chat_id, text, from } => {
+                // Check for /telegram-specific commands first
+                if text.starts_with("/telegram ") || text == "/telegram" {
+                    let parts: Vec<&str> = text.split_whitespace().collect();
+                    let subcommand = parts.get(1).map(|s| *s).unwrap_or("");
+                    
+                    match subcommand {
+                        "connect" => {
+                            // /telegram connect <bot_token>
+                            if parts.len() < 3 {
+                                let reply = "Usage: `/telegram connect <bot_token>`\n\nGet your bot token from @BotFather on Telegram.";
+                                // Send reply directly
+                                let config_path = crate::telegram::config::TelegramConfig::default_path();
+                                if let Ok(cfg) = crate::telegram::config::TelegramConfig::load(&config_path) {
+                                    let mut client = crate::telegram::client::TelegramClient::new();
+                                    client.set_token(&cfg.bot_token);
+                                    let request = crate::telegram::protocol::SendMessageRequest {
+                                        chat_id,
+                                        text: reply.to_string(),
+                                        parse_mode: Some("Markdown".to_string()),
+                                        reply_markup: None,
+                                    };
+                                    let _ = client.send_message(request).await;
+                                }
+                            } else {
+                                let token = parts[2];
+                                let _ = input_tx_self.send(ShellInput::TelegramConnect { bot_token: token.to_string() });
+                            }
+                            continue;
+                        }
+                        "disconnect" => {
+                            let _ = input_tx_self.send(ShellInput::TelegramDisconnect);
+                            continue;
+                        }
+                        "status" => {
+                            let config_path = crate::telegram::config::TelegramConfig::default_path();
+                            let status_msg = if config_path.exists() {
+                                "✅ Telegram bridge is configured and running.\n\nBot token: saved\nPolling: active"
+                            } else {
+                                "❌ Telegram bridge is not configured.\n\nUse `/telegram connect <bot_token>` to connect."
+                            };
+                            
+                            if let Ok(cfg) = crate::telegram::config::TelegramConfig::load(&config_path) {
+                                let mut client = crate::telegram::client::TelegramClient::new();
+                                client.set_token(&cfg.bot_token);
+                                let request = crate::telegram::protocol::SendMessageRequest {
+                                    chat_id,
+                                    text: status_msg.to_string(),
+                                    parse_mode: Some("Markdown".to_string()),
+                                    reply_markup: None,
+                                };
+                                let _ = client.send_message(request).await;
+                            }
+                            continue;
+                        }
+                        _ => {
+                            // Unknown subcommand, let agent handle it
+                        }
+                    }
+                }
+                
                 let bridge_client = state.line_session.as_ref().map(|s| s.client.clone());
                 let mut event_rx = events_tx.subscribe();
                 let _from_display = from.as_ref().map(|u| u.first_name.clone()).unwrap_or_default();
@@ -2209,17 +2275,41 @@ async fn run_worker(
                     });
 
                     let mut buf = String::new();
+                    let mut thinking_buf = String::new();
+                    let mut event_count = 0;
                     while let Ok(ev) = event_rx.recv().await {
+                        event_count += 1;
+                        eprintln!("[Telegram] collector received event #{}: {:?}", event_count, std::mem::discriminant(&ev));
                         if let Some(tx) = &bridge_tx {
                             if let Some(envelope) = view_event_to_chat_envelope(&ev) {
                                 let _ = tx.send(envelope);
                             }
                         }
                         match ev {
-                            ViewEvent::AssistantTextDelta(s) => buf.push_str(&s),
-                            ViewEvent::ToolCallStart { .. } => buf.clear(),
-                            ViewEvent::TurnDone => break,
+                            ViewEvent::AssistantTextDelta(s) => {
+                                eprintln!("[Telegram] captured text delta: {}", s);
+                                buf.push_str(&s);
+                            }
+                            ViewEvent::AssistantThinkingDelta(s) => {
+                                eprintln!("[Telegram] captured thinking delta: {}", s);
+                                thinking_buf.push_str(&s);
+                            }
+                            ViewEvent::ToolCallStart { .. } => {
+                                eprintln!("[Telegram] tool call started, clearing buffers");
+                                buf.clear();
+                                thinking_buf.clear();
+                            }
+                            ViewEvent::TurnDone => {
+                                eprintln!("[Telegram] turn done - text len: {}, thinking len: {}", buf.len(), thinking_buf.len());
+                                // If no text response but thinking exists, use thinking as fallback
+                                if buf.is_empty() && !thinking_buf.is_empty() {
+                                    eprintln!("[Telegram] no text response, using thinking as fallback");
+                                    buf = thinking_buf.clone();
+                                }
+                                break;
+                            }
                             ViewEvent::ErrorText(s) => {
+                                eprintln!("[Telegram] error text: {}", s);
                                 if buf.is_empty() {
                                     buf.push_str(&s);
                                 } else {
@@ -2232,6 +2322,7 @@ async fn run_worker(
                         }
                     }
                     drop(bridge_tx);
+                    eprintln!("[Telegram] collector exiting, returning text length: {}", buf.len());
                     buf
                 });
                 crate::tools::ask::set_line_driven_turn(true);

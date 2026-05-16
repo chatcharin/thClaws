@@ -140,4 +140,34 @@ impl TelegramClient {
 
         Ok(resp.status().is_success())
     }
+
+    /// Call `setMyCommands` to register bot commands that appear
+    /// when users type `/` in the chat.
+    pub async fn set_my_commands(
+        &self,
+        commands: Vec<crate::telegram::protocol::BotCommand>,
+    ) -> Result<bool, String> {
+        let url = format!("{}/setMyCommands", self.base_url);
+        let request = crate::telegram::protocol::SetMyCommandsRequest {
+            commands: Some(commands),
+        };
+        let resp = self.client.post(&url)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| format!("setMyCommands request failed: {}", e))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("setMyCommands failed: {} - {}", status, body));
+        }
+
+        let data: serde_json::Value = resp.json().await
+            .map_err(|e| format!("setMyCommands parse error: {}", e))?;
+
+        data.get("ok")
+            .and_then(|v| v.as_bool())
+            .ok_or("setMyCommands: no ok field".to_string())
+    }
 }

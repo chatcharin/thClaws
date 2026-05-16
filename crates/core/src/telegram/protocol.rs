@@ -132,6 +132,20 @@ pub struct SendMessageRequest {
     pub reply_markup: Option<serde_json::Value>,
 }
 
+/// Bot command definition for setMyCommands.
+#[derive(Debug, Clone, Serialize)]
+pub struct BotCommand {
+    pub command: String,
+    pub description: String,
+}
+
+/// Request payload for setMyCommands.
+#[derive(Debug, Clone, Serialize)]
+pub struct SetMyCommandsRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commands: Option<Vec<BotCommand>>,
+}
+
 /// Request payload for sending a document.
 #[derive(Debug, Clone, Serialize)]
 pub struct SendDocumentRequest {

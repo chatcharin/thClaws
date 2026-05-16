@@ -107,4 +107,54 @@ impl TelegramBridge {
             loop_handle.stop();
         }
     }
+
+    /// Register bot commands with Telegram so they appear in the
+    /// command menu when users type `/`. Called once on connect.
+    pub async fn register_commands(&self) -> Result<(), String> {
+        let client = self.client.lock().await;
+        let commands = vec![
+            crate::telegram::protocol::BotCommand {
+                command: "help".to_string(),
+                description: "Show available thClaws commands".to_string(),
+            },
+            crate::telegram::protocol::BotCommand {
+                command: "model".to_string(),
+                description: "Change AI model".to_string(),
+            },
+            crate::telegram::protocol::BotCommand {
+                command: "provider".to_string(),
+                description: "Change AI provider".to_string(),
+            },
+            crate::telegram::protocol::BotCommand {
+                command: "skill".to_string(),
+                description: "Install or list skills".to_string(),
+            },
+            crate::telegram::protocol::BotCommand {
+                command: "mcp".to_string(),
+                description: "Manage MCP servers".to_string(),
+            },
+            crate::telegram::protocol::BotCommand {
+                command: "telegram".to_string(),
+                description: "Telegram bridge commands (connect/disconnect/status)".to_string(),
+            },
+            crate::telegram::protocol::BotCommand {
+                command: "plan".to_string(),
+                description: "Enter plan mode".to_string(),
+            },
+            crate::telegram::protocol::BotCommand {
+                command: "goal".to_string(),
+                description: "Start goal-directed loop".to_string(),
+            },
+            crate::telegram::protocol::BotCommand {
+                command: "loop".to_string(),
+                description: "Start iteration loop".to_string(),
+            },
+            crate::telegram::protocol::BotCommand {
+                command: "kms".to_string(),
+                description: "Knowledge base commands".to_string(),
+            },
+        ];
+        client.set_my_commands(commands).await?;
+        Ok(())
+    }
 }
