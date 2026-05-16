@@ -2603,6 +2603,54 @@ async fn run_worker(
                     return;
                 }
                 
+                // Set up response collector (same as TelegramMessage)
+                let (event_tx, event_rx) = tokio::sync::broadcast::channel(128);
+                
+                // Subscribe to events before running the turn
+                events_tx.subscribe();
+                let mut event_rx_collector = events_tx.subscribe();
+                
+                let collector = tokio::spawn(async move {
+                    let mut buf = String::new();
+                    let mut thinking_buf = String::new();
+                    while let Ok(ev) = event_rx_collector.recv().await {
+                        match ev {
+                            ViewEvent::AssistantTextDelta(s) => {
+                                buf.push_str(&s);
+                            }
+                            ViewEvent::AssistantThinkingDelta(s) => {
+                                thinking_buf.push_str(&s);
+                            }
+                            ViewEvent::SlashOutput(s) => {
+                                if buf.is_empty() {
+                                    buf.push_str(&s);
+                                } else {
+                                    buf.push_str("\n\n");
+                                    buf.push_str(&s);
+                                }
+                            }
+                            ViewEvent::ToolCallStart { .. } => {
+                                buf.clear();
+                                thinking_buf.clear();
+                            }
+                            ViewEvent::TurnDone => {
+                                if buf.is_empty() && !thinking_buf.is_empty() {
+                                    buf = thinking_buf.clone();
+                                }
+                                break;
+                            }
+                            ViewEvent::ErrorText(s) => {
+                                if buf.is_empty() {
+                                    buf.push_str(&s);
+                                }
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                    buf
+                });
+                
                 // Set Telegram-driven turn flag
                 crate::tools::ask::set_telegram_driven_turn(true);
                 handle_line_with_images(
@@ -2615,8 +2663,73 @@ async fn run_worker(
                 ).await;
                 crate::tools::ask::set_telegram_driven_turn(false);
                 
-                // Reply is sent by the existing TelegramMessage handler logic
-                // since handle_line_with_images already broadcasts events
+                // Wait for response collection to complete
+                let final_text = collector.await.unwrap_or_default();
+                eprintln!("[Telegram] Photo reply collected: {} chars", final_text.len());
+                
+                // Send the reply back to Telegram
+                if !final_text.is_empty() {
+                    let config_path = crate::telegram::config::TelegramConfig::default_path();
+                    if let Ok(cfg) = crate::telegram::config::TelegramConfig::load(&config_path) {
+                        let mut client = crate::telegram::client::TelegramClient::new();
+                        client.set_token(&cfg.bot_token);
+                        
+                        // Telegram has a 4096 character limit per message
+                        const TELEGRAM_MAX_LENGTH: usize = 4000;
+                        if final_text.len() <= TELEGRAM_MAX_LENGTH {
+                            let request = crate::telegram::protocol::SendMessageRequest {
+                                chat_id,
+                                text: final_text.clone(),
+                                parse_mode: None,
+                                reply_markup: None,
+                            };
+                            if let Err(e) = client.send_message(request).await {
+                                eprintln!("[Telegram] Failed to send photo reply: {}", e);
+                            }
+                        } else {
+                            eprintln!("[Telegram] Splitting long photo reply ({} chars)", final_text.len());
+                            let mut chunks: Vec<String> = Vec::new();
+                            let mut remaining = final_text.as_str();
+                            
+                            while !remaining.is_empty() {
+                                if remaining.len() <= TELEGRAM_MAX_LENGTH {
+                                    chunks.push(remaining.to_string());
+                                    break;
+                                }
+                                
+                                let split_at = remaining[..TELEGRAM_MAX_LENGTH]
+                                    .rfind('\n')
+                                    .or_else(|| remaining[..TELEGRAM_MAX_LENGTH].rfind(' '))
+                                    .unwrap_or(TELEGRAM_MAX_LENGTH);
+                                
+                                chunks.push(remaining[..split_at].to_string());
+                                remaining = &remaining[split_at..];
+                            }
+                            
+                            let total_chunks = chunks.len();
+                            for (i, chunk) in chunks.iter().enumerate() {
+                                let request = crate::telegram::protocol::SendMessageRequest {
+                                    chat_id,
+                                    text: if total_chunks > 1 {
+                                        format!("({}/{})\n{}", i + 1, total_chunks, chunk)
+                                    } else {
+                                        chunk.clone()
+                                    },
+                                    parse_mode: None,
+                                    reply_markup: None,
+                                };
+                                if let Err(e) = client.send_message(request).await {
+                                    eprintln!("[Telegram] Failed to send photo chunk {}/{}: {}", i + 1, total_chunks, e);
+                                }
+                                if i < total_chunks - 1 {
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                                }
+                            }
+                        }
+                    } else {
+                        eprintln!("[Telegram] No bot token available to send photo reply");
+                    }
+                }
             }
             ShellInput::McpAppCallTool {
                 request_id,
