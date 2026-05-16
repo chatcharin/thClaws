@@ -118,6 +118,7 @@ pub struct CallbackQuery {
     pub from: User,
     pub message: Option<Message>,
     pub inline_message_id: Option<String>,
+    #[serde(default)]
     pub data: String,
 }
 

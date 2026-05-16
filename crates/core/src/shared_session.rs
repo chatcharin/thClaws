@@ -1602,7 +1602,7 @@ async fn run_worker(
             tokio::spawn(async move {
                 match crate::telegram::config::TelegramConfig::load(&config_path_clone) {
                     Ok(cfg) => {
-                        eprintln!("[Telegram] Auto-starting from saved config...");
+                        eprintln!("[Telegram] Auto-starting from saved config");
                         let _ = tx_clone.send(ShellInput::TelegramConnect { bot_token: cfg.bot_token });
                     }
                     Err(e) => eprintln!("[Telegram] failed to load on-disk config: {e}"),
@@ -2133,7 +2133,7 @@ async fn run_worker(
                 match bridge.validate_token(&bot_token).await {
                     Ok(display_name) => {
                         let _ = bridge.save_config(&bot_token).await;
-                        eprintln!("[Telegram] Token validated: {}", display_name);
+                        eprintln!("[Telegram] Connected: {}", display_name);
 
                         // Spawn the polling loop
                         let handler = TelegramWorkerHandler {
@@ -2144,12 +2144,10 @@ async fn run_worker(
                             eprintln!("[Telegram] Failed to start polling: {}", e);
                             let _ = events_tx.send(ViewEvent::TelegramStatus(Err(e)));
                         } else {
-                            eprintln!("[Telegram] Polling started successfully");
+                            eprintln!("[Telegram] Polling started");
                             // Register bot commands for autocomplete
                             if let Err(e) = bridge.register_commands().await {
                                 eprintln!("[Telegram] Failed to register commands: {}", e);
-                            } else {
-                                eprintln!("[Telegram] Bot commands registered");
                             }
                             let _ = events_tx.send(ViewEvent::TelegramStatus(Ok(true)));
                         }
@@ -2170,7 +2168,7 @@ async fn run_worker(
                 if let Some(tx) = state.telegram_poll_tx.take() {
                     let _ = tx.send(());
                 }
-                eprintln!("[Telegram] Polling stopped");
+                eprintln!("[Telegram] Disconnected");
                 let _ = events_tx.send(ViewEvent::TelegramStatus(Ok(false)));
             }
             // TelegramMessage — incoming text from Telegram polling loop.
@@ -2276,10 +2274,7 @@ async fn run_worker(
 
                     let mut buf = String::new();
                     let mut thinking_buf = String::new();
-                    let mut event_count = 0;
                     while let Ok(ev) = event_rx.recv().await {
-                        event_count += 1;
-                        eprintln!("[Telegram] collector received event #{}: {:?}", event_count, std::mem::discriminant(&ev));
                         if let Some(tx) = &bridge_tx {
                             if let Some(envelope) = view_event_to_chat_envelope(&ev) {
                                 let _ = tx.send(envelope);
@@ -2287,15 +2282,12 @@ async fn run_worker(
                         }
                         match ev {
                             ViewEvent::AssistantTextDelta(s) => {
-                                eprintln!("[Telegram] captured text delta: {}", s);
                                 buf.push_str(&s);
                             }
                             ViewEvent::AssistantThinkingDelta(s) => {
-                                eprintln!("[Telegram] captured thinking delta: {}", s);
                                 thinking_buf.push_str(&s);
                             }
                             ViewEvent::SlashOutput(s) => {
-                                eprintln!("[Telegram] captured slash output (length: {})", s.len());
                                 // Slash commands output directly
                                 if buf.is_empty() {
                                     buf.push_str(&s);
@@ -2305,21 +2297,19 @@ async fn run_worker(
                                 }
                             }
                             ViewEvent::ToolCallStart { .. } => {
-                                eprintln!("[Telegram] tool call started, clearing buffers");
                                 buf.clear();
                                 thinking_buf.clear();
                             }
                             ViewEvent::TurnDone => {
-                                eprintln!("[Telegram] turn done - text len: {}, thinking len: {}", buf.len(), thinking_buf.len());
                                 // If no text response but thinking exists, use thinking as fallback
                                 if buf.is_empty() && !thinking_buf.is_empty() {
-                                    eprintln!("[Telegram] no text response, using thinking as fallback");
+                                    eprintln!("[Telegram] Using thinking text as fallback ({} chars)", thinking_buf.len());
                                     buf = thinking_buf.clone();
                                 }
                                 break;
                             }
                             ViewEvent::ErrorText(s) => {
-                                eprintln!("[Telegram] error text: {}", s);
+                                eprintln!("[Telegram] Error: {}", s);
                                 if buf.is_empty() {
                                     buf.push_str(&s);
                                 } else {
@@ -2332,14 +2322,13 @@ async fn run_worker(
                         }
                     }
                     drop(bridge_tx);
-                    eprintln!("[Telegram] collector exiting, returning text length: {}", buf.len());
+                    eprintln!("[Telegram] Reply collected: {} chars", buf.len());
                     buf
                 });
                 crate::tools::ask::set_line_driven_turn(true);
                 handle_line(text, &mut state, &events_tx, &cancel, &input_tx_self).await;
                 crate::tools::ask::set_line_driven_turn(false);
                 let final_text = collector.await.unwrap_or_default();
-                eprintln!("[Telegram] Reply to chat {}: {} chars", chat_id, final_text.len());
                 
                 // Send the reply back to Telegram
                 if !final_text.is_empty() {
@@ -2360,7 +2349,7 @@ async fn run_worker(
                             }
                         } else {
                             // Long message, split into chunks
-                            eprintln!("[Telegram] Message too long ({} chars), splitting into chunks", final_text.len());
+                            eprintln!("[Telegram] Splitting long message ({} chars)", final_text.len());
                             let mut chunks: Vec<String> = Vec::new();
                             let mut remaining = final_text.as_str();
                             
@@ -2395,8 +2384,6 @@ async fn run_worker(
                                 };
                                 if let Err(e) = client.send_message(request).await {
                                     eprintln!("[Telegram] Failed to send chunk {}/{}: {}", i + 1, total_chunks, e);
-                                } else {
-                                    eprintln!("[Telegram] Sent chunk {}/{}", i + 1, total_chunks);
                                 }
                                 // Small delay between messages to avoid rate limiting
                                 if i < total_chunks - 1 {

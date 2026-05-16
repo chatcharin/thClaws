@@ -15,7 +15,6 @@ use tokio::sync::Mutex;
 
 /// Long polling loop handle.
 pub struct TelegramPollingLoop {
-    bot_token: String,
     handler: Box<dyn MessageHandler + Send + Sync>,
     client: Arc<Mutex<TelegramClient>>,
     running: Arc<AtomicBool>,
@@ -23,12 +22,11 @@ pub struct TelegramPollingLoop {
 
 impl TelegramPollingLoop {
     /// Create a new polling loop.
-    pub fn new<H>(bot_token: String, handler: H, client: Arc<tokio::sync::Mutex<TelegramClient>>) -> Self
+    pub fn new<H>(_bot_token: String, handler: H, client: Arc<tokio::sync::Mutex<TelegramClient>>) -> Self
     where
         H: MessageHandler + Send + Sync + 'static,
     {
         Self {
-            bot_token,
             handler: Box::new(handler),
             client,
             running: Arc::new(AtomicBool::new(true)),
@@ -96,14 +94,41 @@ impl TelegramPollingLoop {
 
     /// Dispatch an incoming message to the handler.
     async fn dispatch_message(&self, msg: &Message) {
- eprintln!("[Telegram] Received message from @{}: {:?}",
-            msg.from.as_ref().map(|u| if u.username.is_empty() { "unknown" } else { &u.username }).unwrap_or("unknown"),
-            msg.text.as_deref().unwrap_or("")
-        );
-
-        let text = msg.text.clone().unwrap_or_default();
         let chat_id = msg.chat.id;
         let from = msg.from.clone();
+        let text = msg.text.clone().unwrap_or_default();
+        
+        // Authorization check: reject messages from unauthorized users
+        let config_path = crate::telegram::config::TelegramConfig::default_path();
+        if let Ok(cfg) = crate::telegram::config::TelegramConfig::load(&config_path) {
+            if !cfg.allowed_chat_ids.is_empty() && !cfg.allowed_chat_ids.contains(&chat_id) {
+                eprintln!("[Telegram] Unauthorized chat_id {} blocked", chat_id);
+                // Send rejection message
+                let mut client = crate::telegram::client::TelegramClient::new();
+                client.set_token(&cfg.bot_token);
+                let request = crate::telegram::protocol::SendMessageRequest {
+                    chat_id,
+                    text: "⚠️ You are not authorized to use this bot.".to_string(),
+                    parse_mode: None,
+                    reply_markup: None,
+                };
+                let _ = client.send_message(request).await;
+                return;
+            }
+        }
+        
+        // Auto-register first user if no allowlist configured
+        let config_path = crate::telegram::config::TelegramConfig::default_path();
+        if let Ok(mut cfg) = crate::telegram::config::TelegramConfig::load(&config_path) {
+            if cfg.allowed_chat_ids.is_empty() {
+                cfg.allowed_chat_ids.push(chat_id);
+                let _ = cfg.save(&config_path);
+                eprintln!("[Telegram] Auto-registered chat_id {}", chat_id);
+            }
+        }
+        
+        let username = from.as_ref().map(|u| if u.username.is_empty() { "unknown" } else { &u.username }).unwrap_or("unknown");
+        eprintln!("[Telegram] Message from @{} (chat {})", username, chat_id);
 
         // Handle inline keyboard callbacks embedded in text
         if let Some(ref markup) = msg.reply_markup {

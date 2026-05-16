@@ -31,16 +31,6 @@ impl TelegramClient {
         self.base_url = format!("https://api.telegram.org/bot{}", token.trim());
     }
 
-    /// Get the current bot token (for config save).
-    pub fn bot_token(&self) -> Option<String> {
-        if self.base_url.is_empty() {
-            None
-        } else {
-            Some(self.base_url.strip_prefix("https://api.telegram.org/bot")
-                .unwrap_or("").to_string())
-        }
-    }
-
     /// Call `getMe` to verify the bot token.
     pub async fn get_me(&self) -> Result<User, String> {
         let url = format!("{}/getMe", self.base_url);

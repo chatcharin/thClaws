@@ -14,6 +14,10 @@ pub struct TelegramConfig {
     pub bot_token: String,
     /// When the config was last updated.
     pub updated_at: String,
+    /// Chat IDs that are allowed to interact with this bot.
+    /// If empty, all users are allowed (not recommended for production).
+    #[serde(default)]
+    pub allowed_chat_ids: Vec<i64>,
 }
 
 impl TelegramConfig {
@@ -22,6 +26,7 @@ impl TelegramConfig {
         Self {
             bot_token,
             updated_at: chrono::Utc::now().to_rfc3339(),
+            allowed_chat_ids: Vec::new(),
         }
     }
 
@@ -37,7 +42,7 @@ impl TelegramConfig {
         Ok(config)
     }
 
-    /// Save config to disk.
+    /// Save config to disk (atomic write with secure permissions).
     pub fn save(&self, path: &Path) -> Result<(), String> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
@@ -45,8 +50,24 @@ impl TelegramConfig {
         }
         let content = serde_json::to_string_pretty(self)
             .map_err(|e| format!("Failed to serialize config: {}", e))?;
-        fs::write(path, content)
+        
+        // Atomic write: write to temp file then rename (prevents corruption on crash)
+        let tmp_path = path.with_extension("json.tmp");
+        fs::write(&tmp_path, &content)
             .map_err(|e| format!("Failed to write config: {}", e))?;
+        
+        // Set secure permissions (owner read/write only) on Unix systems
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(e) = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600)) {
+                eprintln!("[Telegram] Warning: failed to set file permissions: {}", e);
+            }
+        }
+        
+        fs::rename(&tmp_path, path)
+            .map_err(|e| format!("Failed to rename config file: {}", e))?;
+        
         Ok(())
     }
 
