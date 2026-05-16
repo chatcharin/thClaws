@@ -138,16 +138,41 @@ impl crate::telegram::handler::MessageHandler for TelegramWorkerHandler {
         let events_tx = self.events_tx.clone();
         let input_tx_self = self.input_tx_self.clone();
         Box::pin(async move {
-            // For now, treat photo as text with caption
-            // TODO: Download and attach image to message
-            let text = caption.unwrap_or_else(|| "[Photo]".to_string());
-            eprintln!("[Telegram] Photo message: {} ({} files)", text, photo_urls.len());
-            if let Err(e) = input_tx_self.send(ShellInput::TelegramMessage {
-                chat_id,
-                text,
-                from,
-            }) {
-                eprintln!("[Telegram] Failed to push photo message to worker: {}", e);
+            // Download photos and convert to base64
+            let mut images: Vec<(String, String)> = Vec::new();
+            for url in &photo_urls {
+                match download_image_as_base64(url).await {
+                    Ok((media_type, base64_data)) => {
+                        images.push((media_type, base64_data));
+                    }
+                    Err(e) => {
+                        eprintln!("[Telegram] Failed to download image: {}", e);
+                    }
+                }
+            }
+            
+            let text = caption.unwrap_or_else(|| "Analyze this image".to_string());
+            eprintln!("[Telegram] Photo message: {} ({} images downloaded)", text, images.len());
+            
+            if images.is_empty() {
+                // Fallback to text-only if download failed
+                if let Err(e) = input_tx_self.send(ShellInput::TelegramMessage {
+                    chat_id,
+                    text: format!("[Photo] {}", text),
+                    from,
+                }) {
+                    eprintln!("[Telegram] Failed to push photo message to worker: {}", e);
+                }
+            } else {
+                // Send with images
+                if let Err(e) = input_tx_self.send(ShellInput::TelegramMessageWithImages {
+                    chat_id,
+                    text,
+                    images,
+                    from,
+                }) {
+                    eprintln!("[Telegram] Failed to push photo with images to worker: {}", e);
+                }
             }
             let _ = events_tx.send(ViewEvent::TelegramStatus(Ok(true)));
         })
@@ -295,6 +320,15 @@ pub enum ShellInput {
     TelegramMessage {
         chat_id: i64,
         text: String,
+        from: Option<crate::telegram::protocol::User>,
+    },
+    /// Incoming Telegram message with image attachments (photos).
+    /// Images are downloaded and converted to base64 so vision models
+    /// can analyze them.
+    TelegramMessageWithImages {
+        chat_id: i64,
+        text: String,
+        images: Vec<(String, String)>, // (media_type, base64_data)
         from: Option<crate::telegram::protocol::User>,
     },
 }
@@ -2527,6 +2561,25 @@ async fn run_worker(
                     }
                 }
             }
+            // TelegramMessageWithImages — incoming Telegram photo with caption.
+            // Downloads images, converts to base64, and runs agent turn with
+            // vision model support.
+            ShellInput::TelegramMessageWithImages { chat_id, text, images, from } => {
+                // Set Telegram-driven turn flag
+                crate::tools::ask::set_telegram_driven_turn(true);
+                handle_line_with_images(
+                    text,
+                    images,
+                    &mut state,
+                    &events_tx,
+                    &cancel,
+                    &input_tx_self,
+                ).await;
+                crate::tools::ask::set_telegram_driven_turn(false);
+                
+                // Reply is sent by the existing TelegramMessage handler logic
+                // since handle_line_with_images already broadcasts events
+            }
             ShellInput::McpAppCallTool {
                 request_id,
                 qualified_name,
@@ -4694,4 +4747,33 @@ mod tests {
         assert_eq!(display[0].role, "tool");
         assert_eq!(display[0].content, "AskUserQuestion");
     }
+}
+
+/// Download an image from URL and convert to base64.
+/// Returns (media_type, base64_data).
+async fn download_image_as_base64(url: &str) -> Result<(String, String), String> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+    
+    let client = reqwest::Client::new();
+    let response = client.get(url).send().await.map_err(|e| e.to_string())?;
+    
+    if !response.status().is_success() {
+        return Err(format!("Failed to download image: HTTP {}", response.status()));
+    }
+    
+    // Get content type
+    let media_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("image/jpeg")
+        .to_string();
+    
+    // Get bytes
+    let bytes = response.bytes().await.map_err(|e| e.to_string())?;
+    
+    // Convert to base64
+    let base64_data = BASE64.encode(&bytes);
+    
+    Ok((media_type, base64_data))
 }
