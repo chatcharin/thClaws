@@ -2339,19 +2339,70 @@ async fn run_worker(
                 handle_line(text, &mut state, &events_tx, &cancel, &input_tx_self).await;
                 crate::tools::ask::set_line_driven_turn(false);
                 let final_text = collector.await.unwrap_or_default();
-                eprintln!("[Telegram] Reply to chat {}: {}", chat_id, final_text);
+                eprintln!("[Telegram] Reply to chat {}: {} chars", chat_id, final_text.len());
                 
                 // Send the reply back to Telegram
                 if !final_text.is_empty() {
                     if let Some(client) = telegram_client {
-                        let request = crate::telegram::protocol::SendMessageRequest {
-                            chat_id,
-                            text: final_text.clone(),
-                            parse_mode: None,
-                            reply_markup: None,
-                        };
-                        if let Err(e) = client.send_message(request).await {
-                            eprintln!("[Telegram] Failed to send reply: {}", e);
+                        // Telegram has a 4096 character limit per message
+                        // Split long messages into chunks
+                        const TELEGRAM_MAX_LENGTH: usize = 4000; // Leave buffer for safety
+                        if final_text.len() <= TELEGRAM_MAX_LENGTH {
+                            // Short message, send once
+                            let request = crate::telegram::protocol::SendMessageRequest {
+                                chat_id,
+                                text: final_text.clone(),
+                                parse_mode: None,
+                                reply_markup: None,
+                            };
+                            if let Err(e) = client.send_message(request).await {
+                                eprintln!("[Telegram] Failed to send reply: {}", e);
+                            }
+                        } else {
+                            // Long message, split into chunks
+                            eprintln!("[Telegram] Message too long ({} chars), splitting into chunks", final_text.len());
+                            let mut chunks: Vec<String> = Vec::new();
+                            let mut remaining = final_text.as_str();
+                            
+                            while !remaining.is_empty() {
+                                if remaining.len() <= TELEGRAM_MAX_LENGTH {
+                                    chunks.push(remaining.to_string());
+                                    break;
+                                }
+                                
+                                // Find a good split point (newline or space)
+                                let split_at = remaining[..TELEGRAM_MAX_LENGTH]
+                                    .rfind('\n')
+                                    .or_else(|| remaining[..TELEGRAM_MAX_LENGTH].rfind(' '))
+                                    .unwrap_or(TELEGRAM_MAX_LENGTH);
+                                
+                                chunks.push(remaining[..split_at].to_string());
+                                remaining = &remaining[split_at..];
+                            }
+                            
+                            // Send each chunk
+                            let total_chunks = chunks.len();
+                            for (i, chunk) in chunks.iter().enumerate() {
+                                let request = crate::telegram::protocol::SendMessageRequest {
+                                    chat_id,
+                                    text: if total_chunks > 1 {
+                                        format!("({}/{})\n{}", i + 1, total_chunks, chunk)
+                                    } else {
+                                        chunk.clone()
+                                    },
+                                    parse_mode: None,
+                                    reply_markup: None,
+                                };
+                                if let Err(e) = client.send_message(request).await {
+                                    eprintln!("[Telegram] Failed to send chunk {}/{}: {}", i + 1, total_chunks, e);
+                                } else {
+                                    eprintln!("[Telegram] Sent chunk {}/{}", i + 1, total_chunks);
+                                }
+                                // Small delay between messages to avoid rate limiting
+                                if i < total_chunks - 1 {
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                                }
+                            }
                         }
                     } else {
                         eprintln!("[Telegram] No bot token available to send reply");
