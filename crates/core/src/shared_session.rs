@@ -2294,6 +2294,16 @@ async fn run_worker(
                                 eprintln!("[Telegram] captured thinking delta: {}", s);
                                 thinking_buf.push_str(&s);
                             }
+                            ViewEvent::SlashOutput(s) => {
+                                eprintln!("[Telegram] captured slash output (length: {})", s.len());
+                                // Slash commands output directly
+                                if buf.is_empty() {
+                                    buf.push_str(&s);
+                                } else {
+                                    buf.push_str("\n\n");
+                                    buf.push_str(&s);
+                                }
+                            }
                             ViewEvent::ToolCallStart { .. } => {
                                 eprintln!("[Telegram] tool call started, clearing buffers");
                                 buf.clear();
