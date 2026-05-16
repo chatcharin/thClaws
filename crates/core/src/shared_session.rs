@@ -138,8 +138,10 @@ impl crate::telegram::handler::MessageHandler for TelegramWorkerHandler {
         let events_tx = self.events_tx.clone();
         let input_tx_self = self.input_tx_self.clone();
         Box::pin(async move {
-            // Download photos and convert to base64
+            // Try to download photos and convert to base64
             let mut images: Vec<(String, String)> = Vec::new();
+            let mut download_failed = false;
+            
             for url in &photo_urls {
                 match download_image_as_base64(url).await {
                     Ok((media_type, base64_data)) => {
@@ -147,6 +149,7 @@ impl crate::telegram::handler::MessageHandler for TelegramWorkerHandler {
                     }
                     Err(e) => {
                         eprintln!("[Telegram] Failed to download image: {}", e);
+                        download_failed = true;
                     }
                 }
             }
@@ -154,8 +157,11 @@ impl crate::telegram::handler::MessageHandler for TelegramWorkerHandler {
             let text = caption.unwrap_or_else(|| "Analyze this image".to_string());
             eprintln!("[Telegram] Photo message: {} ({} images downloaded)", text, images.len());
             
-            if images.is_empty() {
-                // Fallback to text-only if download failed
+            // Check if we have images and provider supports them
+            // LM Studio and some OpenAI-compatible APIs don't support base64 images
+            // In that case, fallback to text-only
+            if images.is_empty() || download_failed {
+                // Fallback to text-only
                 if let Err(e) = input_tx_self.send(ShellInput::TelegramMessage {
                     chat_id,
                     text: format!("[Photo] {}", text),
@@ -164,7 +170,8 @@ impl crate::telegram::handler::MessageHandler for TelegramWorkerHandler {
                     eprintln!("[Telegram] Failed to push photo message to worker: {}", e);
                 }
             } else {
-                // Send with images
+                // Try to send with images - if provider doesn't support it,
+                // the error will be caught and user will see a message
                 if let Err(e) = input_tx_self.send(ShellInput::TelegramMessageWithImages {
                     chat_id,
                     text,
@@ -172,6 +179,14 @@ impl crate::telegram::handler::MessageHandler for TelegramWorkerHandler {
                     from,
                 }) {
                     eprintln!("[Telegram] Failed to push photo with images to worker: {}", e);
+                    // Fallback to text
+                    if let Err(e) = input_tx_self.send(ShellInput::TelegramMessage {
+                        chat_id,
+                        text: format!("[Photo] {}", text),
+                        from,
+                    }) {
+                        eprintln!("[Telegram] Failed to push fallback photo message: {}", e);
+                    }
                 }
             }
             let _ = events_tx.send(ViewEvent::TelegramStatus(Ok(true)));
@@ -2565,6 +2580,29 @@ async fn run_worker(
             // Downloads images, converts to base64, and runs agent turn with
             // vision model support.
             ShellInput::TelegramMessageWithImages { chat_id, text, images, from } => {
+                // Check if image support is disabled (for LM Studio and incompatible providers)
+                let disable_images = std::env::var("THCLAWS_DISABLE_IMAGES")
+                    .map(|v| v == "1" || v.to_lowercase() == "true")
+                    .unwrap_or(false);
+                
+                if disable_images || images.is_empty() {
+                    // Fallback to text-only
+                    let text_with_note = if images.len() > 0 {
+                        format!("[Photo: {} image(s) - vision not supported by current provider]\n\n{}", images.len(), text)
+                    } else {
+                        text
+                    };
+                    
+                    if let Err(e) = input_tx_self.send(ShellInput::TelegramMessage {
+                        chat_id,
+                        text: text_with_note,
+                        from,
+                    }) {
+                        eprintln!("[Telegram] Failed to push fallback message: {}", e);
+                    }
+                    return;
+                }
+                
                 // Set Telegram-driven turn flag
                 crate::tools::ask::set_telegram_driven_turn(true);
                 handle_line_with_images(
