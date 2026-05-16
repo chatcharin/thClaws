@@ -36,12 +36,27 @@ static GUI_ASK_SENDER: OnceLock<Mutex<Option<mpsc::UnboundedSender<AskUserReques
 /// teaches the model to ask in its reply text instead.
 static LINE_DRIVEN_TURN: AtomicBool = AtomicBool::new(false);
 
+/// Telegram-driven turn flag. Same rationale as LINE — the user
+/// is interacting via Telegram (potentially remote / async). The
+/// AskUserQuestion modal would hang the conversation since there's
+/// no GUI to respond from. The worker sets this at the top of each
+/// Telegram turn so AskUserQuestion short-circuits.
+static TELEGRAM_DRIVEN_TURN: AtomicBool = AtomicBool::new(false);
+
 pub fn set_line_driven_turn(active: bool) {
     LINE_DRIVEN_TURN.store(active, Ordering::Relaxed);
 }
 
 fn is_line_driven_turn() -> bool {
     LINE_DRIVEN_TURN.load(Ordering::Relaxed)
+}
+
+pub fn set_telegram_driven_turn(active: bool) {
+    TELEGRAM_DRIVEN_TURN.store(active, Ordering::Relaxed);
+}
+
+fn is_telegram_driven_turn() -> bool {
+    TELEGRAM_DRIVEN_TURN.load(Ordering::Relaxed)
 }
 
 pub fn set_gui_ask_sender(sender: Option<mpsc::UnboundedSender<AskUserRequest>>) {
@@ -109,6 +124,15 @@ impl Tool for AskUserTool {
             return Ok(format!(
                 "(user is on LINE — please rephrase \"{question}\" as part of your reply text; \
                  their next LINE message will be the answer)"
+            ));
+        }
+        // Plan-07 Phase 3: Telegram-driven turn. Same rationale
+        // as LINE — user is remote on Telegram, GUI modal would
+        // hang the conversation.
+        if is_telegram_driven_turn() {
+            return Ok(format!(
+                "(user is on Telegram — please rephrase \"{question}\" as part of your reply text; \
+                 their next Telegram message will be the answer)"
             ));
         }
         if let Some(sender) = gui_ask_sender() {

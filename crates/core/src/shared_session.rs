@@ -630,6 +630,9 @@ pub struct WorkerState {
     /// session is active.
     pub line_pre_mode: Option<crate::permissions::PermissionMode>,
     pub line_pre_approver: Option<std::sync::Arc<dyn crate::permissions::ApprovalSink>>,
+    /// Plan-07 Phase 3: pre-Telegram-connect snapshot of the agent's
+    /// permission mode, so TelegramDisconnect can restore.
+    pub telegram_pre_mode: Option<crate::permissions::PermissionMode>,
     /// Plan-07 Phase 3: Telegram bridge cancel sender. When
     /// TelegramDisconnect fires, this sender is used to signal the
     /// polling loop task to stop.
@@ -1565,6 +1568,7 @@ async fn run_worker(
         line_session: None,
         line_pre_mode: None,
         line_pre_approver: None,
+        telegram_pre_mode: None,
         telegram_poll_tx: None,
     };
 
@@ -2135,6 +2139,24 @@ async fn run_worker(
                         let _ = bridge.save_config(&bot_token).await;
                         eprintln!("[Telegram] Connected: {}", display_name);
 
+                        // Auto-switch permission mode to TelegramGated
+                        // so approvals can be routed through Telegram
+                        // when inline keyboard support is added.
+                        // Stash the pre-existing mode so TelegramDisconnect
+                        // can restore it (same pattern as LINE).
+                        if state.telegram_pre_mode.is_none() {
+                            state.telegram_pre_mode = Some(state.agent.permission_mode);
+                        }
+                        crate::permissions::set_current_mode_and_broadcast(
+                            crate::permissions::PermissionMode::TelegramGated,
+                        );
+                        if let Err(e) = state.rebuild_agent(true) {
+                            eprintln!("[Telegram] rebuild_agent after mode swap failed: {e}");
+                        }
+                        // Force the rebuilt agent into TelegramGated.
+                        state.agent.permission_mode =
+                            crate::permissions::PermissionMode::TelegramGated;
+
                         // Spawn the polling loop
                         let handler = TelegramWorkerHandler {
                             events_tx: events_tx.clone(),
@@ -2150,6 +2172,9 @@ async fn run_worker(
                                 eprintln!("[Telegram] Failed to register commands: {}", e);
                             }
                             let _ = events_tx.send(ViewEvent::TelegramStatus(Ok(true)));
+                            let _ = events_tx.send(ViewEvent::SlashOutput(
+                                "[Telegram] bridge connected · permissions routed to Telegram".into(),
+                            ));
                         }
                     }
                     Err(e) => {
@@ -2168,8 +2193,22 @@ async fn run_worker(
                 if let Some(tx) = state.telegram_poll_tx.take() {
                     let _ = tx.send(());
                 }
+                
+                // Plan-07 Phase 3: restore the pre-connect permission
+                // mode so the local Ask/Auto/Plan posture resumes.
+                if let Some(prev_mode) = state.telegram_pre_mode.take() {
+                    crate::permissions::set_current_mode_and_broadcast(prev_mode);
+                    state.agent.permission_mode = prev_mode;
+                }
+                if let Err(e) = state.rebuild_agent(true) {
+                    eprintln!("[Telegram] rebuild_agent after disconnect failed: {e}");
+                }
+                
                 eprintln!("[Telegram] Disconnected");
                 let _ = events_tx.send(ViewEvent::TelegramStatus(Ok(false)));
+                let _ = events_tx.send(ViewEvent::SlashOutput(
+                    "[Telegram] bridge disconnected · permissions restored".into(),
+                ));
             }
             // TelegramMessage — incoming text from Telegram polling loop.
             // Routes through the same agent turn pipeline as LINE messages
@@ -2325,9 +2364,11 @@ async fn run_worker(
                     eprintln!("[Telegram] Reply collected: {} chars", buf.len());
                     buf
                 });
-                crate::tools::ask::set_line_driven_turn(true);
+                // Plan-07 Phase 3: set Telegram-driven turn flag
+                // so AskUserQuestion short-circuits (same pattern as LINE)
+                crate::tools::ask::set_telegram_driven_turn(true);
                 handle_line(text, &mut state, &events_tx, &cancel, &input_tx_self).await;
-                crate::tools::ask::set_line_driven_turn(false);
+                crate::tools::ask::set_telegram_driven_turn(false);
                 let final_text = collector.await.unwrap_or_default();
                 
                 // Send the reply back to Telegram

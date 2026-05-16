@@ -1776,7 +1776,11 @@ pub fn build_kms_ingest_session_prompt(
          depending on conversation depth.\n\
          \n\
          2. Call `KmsWrite(kms: \"{kms_name}\", page: \"{page}\", content: \"...\")` with \
-         frontmatter:\n   ---\n   category: session\n   sources: chat\n   description: \
+         frontmatter:
+   ---
+   category: session
+   sources: chat
+   description: \
          <one-line hook>\n   ---\n   <your summary>\n\
          \n\
          Page name: `{page}` ({provenance}).\n\
@@ -6440,6 +6444,7 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                             PermissionMode::Ask => "ask",
                             PermissionMode::Plan => "plan",
                             PermissionMode::LineGated => "linegated",
+                            PermissionMode::TelegramGated => "telegramgated",
                         };
                         println!(
                             "{COLOR_DIM}permissions: {label} (auto = never prompt, ask = prompt on mutating tools, plan = read-only exploration, linegated = prompt routed to LINE chat){COLOR_RESET}"
@@ -6460,8 +6465,22 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                                 );
                                 println!("{COLOR_DIM}permissions → ask{COLOR_RESET}");
                             }
+                            "linegated" => {
+                                agent.permission_mode = PermissionMode::LineGated;
+                                crate::permissions::set_current_mode_and_broadcast(
+                                    PermissionMode::LineGated,
+                                );
+                                println!("{COLOR_DIM}permissions → linegated (approvals via LINE){COLOR_RESET}");
+                            }
+                            "telegramgated" => {
+                                agent.permission_mode = PermissionMode::TelegramGated;
+                                crate::permissions::set_current_mode_and_broadcast(
+                                    PermissionMode::TelegramGated,
+                                );
+                                println!("{COLOR_DIM}permissions → telegramgated (approvals via Telegram){COLOR_RESET}");
+                            }
                             _ => {
-                                println!("{COLOR_YELLOW}usage: /permissions auto|ask{COLOR_RESET}");
+                                println!("{COLOR_YELLOW}usage: /permissions auto|ask|linegated|telegramgated{COLOR_RESET}");
                             }
                         }
                     }

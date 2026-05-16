@@ -43,6 +43,11 @@ pub enum PermissionMode {
     /// approve agent-initiated mutations from their phone when the
     /// LINE bridge is active.
     LineGated,
+    /// Telegram-gated — same as `LineGated` but routes approvals
+    /// to Telegram via inline keyboard buttons. Used when the
+    /// Telegram bridge is active. Only authorized chat_ids
+    /// (from `allowed_chat_ids` in config) can approve.
+    TelegramGated,
 }
 
 impl PermissionMode {
@@ -50,7 +55,7 @@ impl PermissionMode {
     /// calls. Centralised so a future "Slack-gated" / "Discord-
     /// gated" variant just opts into the same arm.
     pub fn asks_for_approval(&self) -> bool {
-        matches!(self, Self::Ask | Self::LineGated)
+        matches!(self, Self::Ask | Self::LineGated | Self::TelegramGated)
     }
 
     /// True when this mode blocks mutating calls outright (Plan

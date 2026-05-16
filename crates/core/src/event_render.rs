@@ -191,6 +191,7 @@ pub fn render_chat_dispatches(ev: &ViewEvent) -> Vec<String> {
                 crate::permissions::PermissionMode::Ask => "ask",
                 crate::permissions::PermissionMode::Plan => "plan",
                 crate::permissions::PermissionMode::LineGated => "linegated",
+                crate::permissions::PermissionMode::TelegramGated => "telegramgated",
             };
             let payload = serde_json::json!({
                 "type": "chat_permission_mode",
