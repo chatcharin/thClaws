@@ -91,3 +91,61 @@ impl TelegramConfig {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn config_new_sets_timestamp() {
+        let cfg = TelegramConfig::new("test-token".to_string());
+        assert_eq!(cfg.bot_token, "test-token");
+        assert!(!cfg.updated_at.is_empty());
+        assert!(cfg.allowed_chat_ids.is_empty());
+    }
+
+    #[test]
+    fn config_serialize_round_trip() {
+        let cfg = TelegramConfig::new("token-123".to_string());
+        let json = serde_json::to_string(&cfg).unwrap();
+        let loaded: TelegramConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.bot_token, cfg.bot_token);
+        assert_eq!(loaded.updated_at, cfg.updated_at);
+    }
+
+    #[test]
+    fn config_load_save_with_allowed_chat_ids() {
+        let tmp_dir = std::env::temp_dir().join("thclaws_test");
+        let _ = fs::remove_dir_all(&tmp_dir);
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let path = tmp_dir.join("telegram.json");
+
+        let mut cfg = TelegramConfig::new("test-token".to_string());
+        cfg.allowed_chat_ids = vec![123456789, 987654321];
+        cfg.save(&path).unwrap();
+
+        let loaded = TelegramConfig::load(&path).unwrap();
+        assert_eq!(loaded.bot_token, "test-token");
+        assert_eq!(loaded.allowed_chat_ids, vec![123456789, 987654321]);
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn config_delete_removes_file() {
+        let tmp_dir = std::env::temp_dir().join("thclaws_test_delete");
+        let _ = fs::remove_dir_all(&tmp_dir);
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let path = tmp_dir.join("telegram.json");
+
+        let cfg = TelegramConfig::new("token".to_string());
+        cfg.save(&path).unwrap();
+        assert!(path.exists());
+
+        TelegramConfig::delete(&path).unwrap();
+        assert!(!path.exists());
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+}
