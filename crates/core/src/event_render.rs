@@ -253,6 +253,20 @@ pub fn render_chat_dispatches(ev: &ViewEvent) -> Vec<String> {
             "error": error,
         })
         .to_string()],
+        ViewEvent::TelegramStatus(result) => {
+            let payload = match result {
+                Ok(connected) => serde_json::json!({
+                    "type": "chat_telegram_status",
+                    "connected": connected,
+                }),
+                Err(e) => serde_json::json!({
+                    "type": "chat_telegram_status",
+                    "connected": false,
+                    "error": e,
+                }),
+            };
+            vec![payload.to_string()]
+        }
     }
 }
 
@@ -500,6 +514,11 @@ pub fn render_terminal_ansi(state: &mut TerminalRenderState, ev: &ViewEvent) -> 
         ViewEvent::SideChannelError { id, error } => Some(format!(
             "\r\n\x1b[31m[agent {id} ✗ {error}]\x1b[0m\r\n"
         )),
+        ViewEvent::TelegramStatus(result) => match result {
+            Ok(true) => Some("\r\n\x1b[32m[telegram] connected\x1b[0m\r\n".to_string()),
+            Ok(false) => Some("\r\n\x1b[33m[telegram] disconnected\x1b[0m\r\n".to_string()),
+            Err(e) => Some(format!("\r\n\x1b[31m[telegram] error: {}\x1b[0m\r\n", e)),
+        },
     };
 
     match inner {

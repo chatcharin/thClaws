@@ -4343,6 +4343,7 @@ dependencies = [
  "comrak",
  "cron",
  "csv",
+ "dirs",
  "docx-rs",
  "ed25519-dalek",
  "fs2",

@@ -73,7 +73,42 @@ impl Default for ReadyGate {
 /// reply has exactly one waiter). Plenty of other variants would
 /// have to wrap their payloads in `Arc` just to satisfy `Clone`
 /// even though nothing in the codebase actually clones a
-/// `ShellInput`.
+  /// `ShellInput`.)
+///
+/// TelegramWorkerHandler bridges the Telegram polling loop into the
+/// worker's event bus. It implements `MessageHandler` so incoming
+/// Telegram messages can be pushed into `ShellInput::TelegramMessage`
+/// and drive agent turns identically to LINE messages.
+#[derive(Debug)]
+pub struct TelegramWorkerHandler {
+    events_tx: tokio::sync::broadcast::Sender<ViewEvent>,
+    input_tx_self: std::sync::mpsc::Sender<ShellInput>,
+}
+
+impl crate::telegram::handler::MessageHandler for TelegramWorkerHandler {
+    fn on_message(
+        &self,
+        chat_id: i64,
+        text: String,
+        from: Option<crate::telegram::protocol::User>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        let events_tx = self.events_tx.clone();
+        let input_tx_self = self.input_tx_self.clone();
+        Box::pin(async move {
+            // Push the Telegram message into the worker loop
+            if let Err(e) = input_tx_self.send(ShellInput::TelegramMessage {
+                chat_id,
+                text,
+                from,
+            }) {
+                eprintln!("[Telegram] Failed to push message to worker: {}", e);
+            }
+            // Notify UI that Telegram is active
+            let _ = events_tx.send(ViewEvent::TelegramStatus(Ok(true)));
+        })
+    }
+}
+
 #[derive(Debug)]
 pub enum ShellInput {
     /// Raw line submitted by the user. Slash-prefix → dispatched as
@@ -177,6 +212,19 @@ pub enum ShellInput {
     LineMessage {
         text: String,
         respond: tokio::sync::oneshot::Sender<String>,
+    },
+    /// IPC request to start Telegram long-polling with the given bot
+    /// token. Worker saves config, spawns the polling loop with a
+    /// TelegramWorkerHandler, and broadcasts ViewEvent::TelegramStatus.
+    TelegramConnect { bot_token: String },
+    /// IPC request to stop the Telegram polling loop.
+    TelegramDisconnect,
+    /// Incoming Telegram text message pushed from the polling loop
+    /// into the worker so it drives `Agent::run_turn`.
+    TelegramMessage {
+        chat_id: i64,
+        text: String,
+        from: Option<crate::telegram::protocol::User>,
     },
 }
 
@@ -369,6 +417,9 @@ pub enum ViewEvent {
         id: String,
         error: String,
     },
+    /// Telegram connection status change: `Ok(true)` = connected,
+    /// `Ok(false)` = disconnected, `Err(...)` = error.
+    TelegramStatus(Result<bool, String>),
 }
 
 #[derive(Debug, Clone)]
@@ -579,6 +630,10 @@ pub struct WorkerState {
     /// session is active.
     pub line_pre_mode: Option<crate::permissions::PermissionMode>,
     pub line_pre_approver: Option<std::sync::Arc<dyn crate::permissions::ApprovalSink>>,
+    /// Plan-07 Phase 3: Telegram bridge cancel sender. When
+    /// TelegramDisconnect fires, this sender is used to signal the
+    /// polling loop task to stop.
+    pub telegram_poll_tx: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 /// M6.29: handle to a running `/loop` task.
@@ -1510,6 +1565,7 @@ async fn run_worker(
         line_session: None,
         line_pre_mode: None,
         line_pre_approver: None,
+        telegram_poll_tx: None,
     };
 
     // M6.35 HOOK2: fire session_start hook now that WorkerState is
@@ -1533,6 +1589,26 @@ async fn run_worker(
         }
         Ok(None) => {}
         Err(e) => eprintln!("[line] failed to load on-disk config: {e}"),
+    }
+
+    // Plan-07 Phase 3: auto-start the Telegram bridge on worker
+    // boot when a bot token is already on disk. Mirrors the LINE
+    // auto-reconnect pattern above.
+    {
+        let telegram_config_path = crate::telegram::config::TelegramConfig::default_path();
+        if telegram_config_path.exists() {
+            let tx_clone = input_tx_self.clone();
+            let config_path_clone = telegram_config_path.clone();
+            tokio::spawn(async move {
+                match crate::telegram::config::TelegramConfig::load(&config_path_clone) {
+                    Ok(cfg) => {
+                        eprintln!("[Telegram] Auto-starting from saved config...");
+                        let _ = tx_clone.send(ShellInput::TelegramConnect { bot_token: cfg.bot_token });
+                    }
+                    Err(e) => eprintln!("[Telegram] failed to load on-disk config: {e}"),
+                }
+            });
+        }
     }
 
     // Lead inbox poller — parity with repl.rs:1524. Without this, teammates
@@ -2047,6 +2123,139 @@ async fn run_worker(
                 crate::tools::ask::set_line_driven_turn(false);
                 let final_text = collector.await.unwrap_or_default();
                 let _ = respond.send(final_text);
+            }
+            // Plan-07 Phase 3: Telegram bridge connect — saves bot token
+            // and starts the long-polling loop.
+            ShellInput::TelegramConnect { bot_token } => {
+                // Save config and validate token
+                let config_path = crate::telegram::config::TelegramConfig::default_path();
+                let bridge = crate::telegram::TelegramBridge::new(config_path.clone());
+                match bridge.validate_token(&bot_token).await {
+                    Ok(display_name) => {
+                        let _ = bridge.save_config(&bot_token).await;
+                        eprintln!("[Telegram] Token validated: {}", display_name);
+
+                        // Spawn the polling loop
+                        let handler = TelegramWorkerHandler {
+                            events_tx: events_tx.clone(),
+                            input_tx_self: input_tx_self.clone(),
+                        };
+                        if let Err(e) = bridge.start(handler).await {
+                            eprintln!("[Telegram] Failed to start polling: {}", e);
+                            let _ = events_tx.send(ViewEvent::TelegramStatus(Err(e)));
+                        } else {
+                            eprintln!("[Telegram] Polling started successfully");
+                            let _ = events_tx.send(ViewEvent::TelegramStatus(Ok(true)));
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[Telegram] Token validation failed: {}", e);
+                        let _ = events_tx.send(ViewEvent::TelegramStatus(Err(e)));
+                    }
+                }
+            }
+            // TelegramDisconnect — stop the Telegram polling loop.
+            ShellInput::TelegramDisconnect => {
+                let config_path = crate::telegram::config::TelegramConfig::default_path();
+                let mut bridge = crate::telegram::TelegramBridge::new(config_path.clone());
+                bridge.stop().await;
+                let _ = bridge.delete_config();
+                // Signal the polling loop to stop via the cancel sender
+                if let Some(tx) = state.telegram_poll_tx.take() {
+                    let _ = tx.send(());
+                }
+                eprintln!("[Telegram] Polling stopped");
+                let _ = events_tx.send(ViewEvent::TelegramStatus(Ok(false)));
+            }
+            // TelegramMessage — incoming text from Telegram polling loop.
+            // Routes through the same agent turn pipeline as LINE messages
+            // so the model responds identically regardless of source.
+            ShellInput::TelegramMessage { chat_id, text, from } => {
+                let bridge_client = state.line_session.as_ref().map(|s| s.client.clone());
+                let mut event_rx = events_tx.subscribe();
+                let _from_display = from.as_ref().map(|u| u.first_name.clone()).unwrap_or_default();
+                
+                // Create a Telegram client for sending the reply
+                let telegram_client = {
+                    let config_path = crate::telegram::config::TelegramConfig::default_path();
+                    if let Ok(cfg) = crate::telegram::config::TelegramConfig::load(&config_path) {
+                        let mut client = crate::telegram::client::TelegramClient::new();
+                        client.set_token(&cfg.bot_token);
+                        Some(client)
+                    } else {
+                        None
+                    }
+                };
+                
+                let collector = tokio::spawn(async move {
+                    let bridge_tx = bridge_client.as_ref().map(|client| {
+                        let (tx, mut rx) =
+                            tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
+                        let client = client.clone();
+                        tokio::spawn(async move {
+                            while let Some(envelope) = rx.recv().await {
+                                if let Err(first) = client.push_chat_event(envelope.clone()).await {
+                                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                                    if let Err(second) = client.push_chat_event(envelope).await {
+                                        eprintln!(
+                                            "[line] chat-bridge push failed (retry exhausted): \
+                                             first={first}, second={second}"
+                                        );
+                                    }
+                                }
+                            }
+                        });
+                        tx
+                    });
+
+                    let mut buf = String::new();
+                    while let Ok(ev) = event_rx.recv().await {
+                        if let Some(tx) = &bridge_tx {
+                            if let Some(envelope) = view_event_to_chat_envelope(&ev) {
+                                let _ = tx.send(envelope);
+                            }
+                        }
+                        match ev {
+                            ViewEvent::AssistantTextDelta(s) => buf.push_str(&s),
+                            ViewEvent::ToolCallStart { .. } => buf.clear(),
+                            ViewEvent::TurnDone => break,
+                            ViewEvent::ErrorText(s) => {
+                                if buf.is_empty() {
+                                    buf.push_str(&s);
+                                } else {
+                                    buf.push_str("\n\n");
+                                    buf.push_str(&s);
+                                }
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                    drop(bridge_tx);
+                    buf
+                });
+                crate::tools::ask::set_line_driven_turn(true);
+                handle_line(text, &mut state, &events_tx, &cancel, &input_tx_self).await;
+                crate::tools::ask::set_line_driven_turn(false);
+                let final_text = collector.await.unwrap_or_default();
+                eprintln!("[Telegram] Reply to chat {}: {}", chat_id, final_text);
+                
+                // Send the reply back to Telegram
+                if !final_text.is_empty() {
+                    if let Some(client) = telegram_client {
+                        let request = crate::telegram::protocol::SendMessageRequest {
+                            chat_id,
+                            text: final_text.clone(),
+                            parse_mode: None,
+                            reply_markup: None,
+                        };
+                        if let Err(e) = client.send_message(request).await {
+                            eprintln!("[Telegram] Failed to send reply: {}", e);
+                        }
+                    } else {
+                        eprintln!("[Telegram] No bot token available to send reply");
+                    }
+                }
             }
             ShellInput::McpAppCallTool {
                 request_id,

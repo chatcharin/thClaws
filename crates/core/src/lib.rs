@@ -73,6 +73,7 @@ pub mod skills;
 pub mod skills_state;
 pub mod sso;
 pub mod subagent;
+pub mod telegram;
 pub mod team;
 pub mod theme;
 pub mod tokens;

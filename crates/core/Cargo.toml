@@ -116,6 +116,10 @@ ed25519-dalek = { version = "2", default-features = false, features = ["std", "f
 # transitive dep, so this adds little binary weight.
 cron = "0.12"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+# Home / config directory resolution for on-disk config paths
+# (telegram.json, line.json, etc.). No feature flags needed — just
+# the directory resolution functions.
+dirs = "6"
 # Filesystem watcher used by the scheduler daemon's `watchWorkspace`
 # trigger. notify wraps the per-OS native APIs (FSEvents/inotify/
 # ReadDirectoryChangesW); the debouncer coalesces editor save bursts
