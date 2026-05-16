@@ -4792,6 +4792,8 @@ mod tests {
 async fn download_image_as_base64(url: &str) -> Result<(String, String), String> {
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
     
+    eprintln!("[Telegram] Downloading image from: {}", url);
+    
     let client = reqwest::Client::new();
     let response = client.get(url).send().await.map_err(|e| e.to_string())?;
     
@@ -4799,19 +4801,52 @@ async fn download_image_as_base64(url: &str) -> Result<(String, String), String>
         return Err(format!("Failed to download image: HTTP {}", response.status()));
     }
     
-    // Get content type
-    let media_type = response
+    // Get content type from response headers
+    let content_type_header = response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("image/jpeg")
-        .to_string();
+        .unwrap_or("unknown");
     
-    // Get bytes
+    eprintln!("[Telegram] Content-Type from header: {}", content_type_header);
+    
+    // Detect actual image type from magic bytes (file signature)
+    // JPEG: FF D8 FF
+    // PNG: 89 50 4E 47
+    // WebP: 52 49 46 46 ... 57 45 42 50
+    // GIF: 47 49 46 38
     let bytes = response.bytes().await.map_err(|e| e.to_string())?;
+    
+    let detected_type = if bytes.len() >= 3 {
+        if bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF {
+            "image/jpeg"
+        } else if bytes.len() >= 4 && bytes[0] == 0x89 && bytes[1] == 0x50 && bytes[2] == 0x4E && bytes[3] == 0x47 {
+            "image/png"
+        } else if bytes.len() >= 12 && bytes[0] == 0x52 && bytes[1] == 0x49 && bytes[2] == 0x46 && bytes[3] == 0x46 && bytes[8] == 0x57 && bytes[9] == 0x45 && bytes[10] == 0x42 && bytes[11] == 0x50 {
+            "image/webp"
+        } else if bytes.len() >= 4 && bytes[0] == 0x47 && bytes[1] == 0x49 && bytes[2] == 0x46 && bytes[3] == 0x38 {
+            "image/gif"
+        } else {
+            // Unknown - trust the header or fallback
+            if content_type_header.starts_with("image/") {
+                content_type_header
+            } else {
+                eprintln!("[Telegram] WARNING: Unknown image format, falling back to image/jpeg");
+                "image/jpeg"
+            }
+        }
+    } else {
+        eprintln!("[Telegram] WARNING: Image too small, falling back to image/jpeg");
+        "image/jpeg"
+    };
+    
+    let media_type = detected_type.to_string();
+    eprintln!("[Telegram] Detected media type: {}", media_type);
     
     // Convert to base64
     let base64_data = BASE64.encode(&bytes);
+    
+    eprintln!("[Telegram] Image downloaded: {} bytes, media_type={}", bytes.len(), media_type);
     
     Ok((media_type, base64_data))
 }
