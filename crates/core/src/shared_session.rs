@@ -127,6 +127,57 @@ impl crate::telegram::handler::MessageHandler for TelegramWorkerHandler {
             eprintln!("[Telegram] Unhandled callback query: {}", data);
         })
     }
+
+    fn on_photo(
+        &self,
+        chat_id: i64,
+        photo_urls: Vec<String>,
+        caption: Option<String>,
+        from: Option<crate::telegram::protocol::User>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        let events_tx = self.events_tx.clone();
+        let input_tx_self = self.input_tx_self.clone();
+        Box::pin(async move {
+            // For now, treat photo as text with caption
+            // TODO: Download and attach image to message
+            let text = caption.unwrap_or_else(|| "[Photo]".to_string());
+            eprintln!("[Telegram] Photo message: {} ({} files)", text, photo_urls.len());
+            if let Err(e) = input_tx_self.send(ShellInput::TelegramMessage {
+                chat_id,
+                text,
+                from,
+            }) {
+                eprintln!("[Telegram] Failed to push photo message to worker: {}", e);
+            }
+            let _ = events_tx.send(ViewEvent::TelegramStatus(Ok(true)));
+        })
+    }
+
+    fn on_document(
+        &self,
+        chat_id: i64,
+        file_name: String,
+        mime_type: Option<String>,
+        from: Option<crate::telegram::protocol::User>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        let events_tx = self.events_tx.clone();
+        let input_tx_self = self.input_tx_self.clone();
+        Box::pin(async move {
+            // For now, treat document as text message
+            // TODO: Download and process document
+            let mime = mime_type.as_deref().unwrap_or("unknown");
+            let text = format!("[Document: {} ({})]", file_name, mime);
+            eprintln!("[Telegram] Document message: {}", text);
+            if let Err(e) = input_tx_self.send(ShellInput::TelegramMessage {
+                chat_id,
+                text,
+                from,
+            }) {
+                eprintln!("[Telegram] Failed to push document message to worker: {}", e);
+            }
+            let _ = events_tx.send(ViewEvent::TelegramStatus(Ok(true)));
+        })
+    }
 }
 
 #[derive(Debug)]

@@ -9,6 +9,7 @@
 
 use crate::telegram::protocol::*;
 use reqwest::Client;
+use serde::Serialize;
 use serde_json;
 
 /// Telegram Bot API client.
@@ -179,5 +180,49 @@ impl TelegramClient {
         data.get("ok")
             .and_then(|v| v.as_bool())
             .ok_or("answerCallbackQuery: no ok field".to_string())
+    }
+
+    /// Call `getFile` to get file_path for a given file_id.
+    pub async fn get_file(&self, file_id: &str) -> Result<String, String> {
+        let url = format!("{}/getFile", self.base_url);
+        let resp = self.client.get(&url)
+            .query(&[("file_id", file_id)])
+            .send()
+            .await
+            .map_err(|e| format!("getFile request failed: {}", e))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("getFile failed: {} - {}", status, body));
+        }
+
+        let data: serde_json::Value = resp.json().await
+            .map_err(|e| format!("getFile parse error: {}", e))?;
+
+        if !data.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+            return Err(format!("getFile API error: {}", data));
+        }
+
+        data.get("result")
+            .and_then(|r| r.get("file_path"))
+            .and_then(|p| p.as_str())
+            .map(|p| p.to_string())
+            .ok_or("getFile: no file_path in response".to_string())
+    }
+
+    /// Get a direct download URL for a file by file_id.
+    /// Calls getFile API then constructs the download URL.
+    pub async fn get_file_url(&self, file_id: &str) -> Result<String, String> {
+        let file_path = self.get_file(file_id).await?;
+        // Extract token from base_url (format: https://api.telegram.org/bot<TOKEN>)
+        let token = self.base_url
+            .strip_prefix("https://api.telegram.org/bot")
+            .unwrap_or("");
+        if !token.is_empty() {
+            Ok(format!("https://api.telegram.org/file/bot{}/{}", token, file_path))
+        } else {
+            Err("No bot token set".to_string())
+        }
     }
 }

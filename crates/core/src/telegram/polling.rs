@@ -96,7 +96,6 @@ impl TelegramPollingLoop {
     async fn dispatch_message(&self, msg: &Message) {
         let chat_id = msg.chat.id;
         let from = msg.from.clone();
-        let text = msg.text.clone().unwrap_or_default();
         
         // Authorization check: reject messages from unauthorized users
         let config_path = crate::telegram::config::TelegramConfig::default_path();
@@ -130,6 +129,38 @@ impl TelegramPollingLoop {
         let username = from.as_ref().map(|u| if u.username.is_empty() { "unknown" } else { &u.username }).unwrap_or("unknown");
         eprintln!("[Telegram] Message from @{} (chat {})", username, chat_id);
 
+        // Handle photos
+        if let Some(ref photos) = msg.photo {
+            if !photos.is_empty() {
+                // Get the largest photo (last in array)
+                let largest = photos.last().unwrap();
+                let caption = msg.caption.clone();
+                eprintln!("[Telegram] Photo received: {}x{}, file_id={}", largest.width, largest.height, largest.file_id);
+                
+                // Download and process photo
+                let client_guard = self.client.lock().await;
+                if let Ok(file_url) = client_guard.get_file_url(&largest.file_id).await {
+                    drop(client_guard);
+                    self.handler.on_photo(chat_id, vec![file_url], caption, from).await;
+                    return;
+                }
+                drop(client_guard);
+            }
+        }
+
+        // Handle documents
+        if let Some(ref doc) = msg.document {
+            eprintln!("[Telegram] Document received: {} ({})", doc.file_name, doc.mime_type.as_deref().unwrap_or("unknown"));
+            
+            let client_guard = self.client.lock().await;
+            if let Ok(file_url) = client_guard.get_file_url(&doc.file_id).await {
+                drop(client_guard);
+                self.handler.on_document(chat_id, doc.file_name.clone(), doc.mime_type.clone(), from).await;
+                return;
+            }
+            drop(client_guard);
+        }
+
         // Handle inline keyboard callbacks embedded in text
         if let Some(ref markup) = msg.reply_markup {
             for row in &markup.inline_keyboard {
@@ -142,6 +173,7 @@ impl TelegramPollingLoop {
         }
 
         // Handle normal text messages
+        let text = msg.text.clone().unwrap_or_default();
         self.handler.on_message(chat_id, text, from).await;
     }
 
