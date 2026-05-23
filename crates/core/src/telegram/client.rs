@@ -79,6 +79,82 @@ impl TelegramClient {
             .map_err(|e| format!("sendMessage deserialize error: {}", e))
     }
 
+    /// Call `sendDocument` to send a file.
+    pub async fn send_document(&self, request: SendDocumentRequest) -> Result<Message, String> {
+        let url = format!("{}/sendDocument", self.base_url);
+        
+        // Build request body manually since document field is skip_serializing
+        let mut body = serde_json::json!({
+            "chat_id": request.chat_id,
+            "document": request.document,
+        });
+        if let Some(ref caption) = request.caption {
+            body["caption"] = serde_json::json!(caption);
+        }
+        if let Some(reply_id) = request.reply_to_message_id {
+            body["reply_to_message_id"] = serde_json::json!(reply_id);
+        }
+
+        let resp = self.client.post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("sendDocument request failed: {}", e))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(format!("sendDocument failed: {} - {}", status, body_text));
+        }
+
+        let data: serde_json::Value = resp.json().await
+            .map_err(|e| format!("sendDocument parse error: {}", e))?;
+
+        let result = data.get("result")
+            .ok_or("sendDocument: no result field")?;
+
+        serde_json::from_value(result.clone())
+            .map_err(|e| format!("sendDocument deserialize error: {}", e))
+    }
+
+    /// Call `sendPhoto` to send an image.
+    pub async fn send_photo(&self, request: SendPhotoRequest) -> Result<Message, String> {
+        let url = format!("{}/sendPhoto", self.base_url);
+        
+        // Build request body manually since photo field is skip_serializing
+        let mut body = serde_json::json!({
+            "chat_id": request.chat_id,
+            "photo": request.photo,
+        });
+        if let Some(ref caption) = request.caption {
+            body["caption"] = serde_json::json!(caption);
+        }
+        if let Some(reply_id) = request.reply_to_message_id {
+            body["reply_to_message_id"] = serde_json::json!(reply_id);
+        }
+
+        let resp = self.client.post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("sendPhoto request failed: {}", e))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(format!("sendPhoto failed: {} - {}", status, body_text));
+        }
+
+        let data: serde_json::Value = resp.json().await
+            .map_err(|e| format!("sendPhoto parse error: {}", e))?;
+
+        let result = data.get("result")
+            .ok_or("sendPhoto: no result field")?;
+
+        serde_json::from_value(result.clone())
+            .map_err(|e| format!("sendPhoto deserialize error: {}", e))
+    }
+
     /// Call `getUpdates` with long polling.
     /// 
     /// - `timeout`: max seconds to wait (default 10)

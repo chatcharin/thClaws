@@ -155,6 +155,20 @@ pub struct SendDocumentRequest {
     pub document: String, // file_id or path
     #[serde(skip_serializing_if = "Option::is_none")]
     pub caption: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_to_message_id: Option<i64>,
+}
+
+/// Request payload for sending a photo.
+#[derive(Debug, Clone, Serialize)]
+pub struct SendPhotoRequest {
+    pub chat_id: i64,
+    #[serde(skip_serializing)]
+    pub photo: String, // file_id or URL
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caption: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_to_message_id: Option<i64>,
 }
 
 /// Request payload for `answerCallbackQuery`.

@@ -37,6 +37,7 @@ const INPUT_PREVIEW_CHARS: usize = 200;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApprovalReply {
     Allow,
+    AllowForSession,
     Deny,
     DenyForSession,
     /// User tapped something we can't classify.
@@ -56,6 +57,7 @@ impl ApprovalReply {
         };
         let decision = match verb.to_lowercase().as_str() {
             "allow" | "approve" | "yes" => Self::Allow,
+            "allow_session" | "allow session" => Self::AllowForSession,
             "deny" | "reject" | "no" => Self::Deny,
             "session" => Self::DenyForSession,
             _ => Self::Unrecognised,
@@ -133,8 +135,9 @@ impl TelegramApprover {
         
         let decision = match reply {
             ApprovalReply::Allow => ApprovalDecision::Allow,
+            ApprovalReply::AllowForSession => ApprovalDecision::AllowForSession,
             ApprovalReply::Deny => ApprovalDecision::Deny,
-            ApprovalReply::DenyForSession => ApprovalDecision::AllowForSession,
+            ApprovalReply::DenyForSession => ApprovalDecision::Deny,
             ApprovalReply::Unrecognised => return None,
         };
 
@@ -178,6 +181,12 @@ impl TelegramApprover {
                         "text": "✅ Approve",
                         "callback_data": format!("tool:allow:{}", request_id)
                     },
+                    {
+                        "text": "✅✅ Allow Session",
+                        "callback_data": format!("tool:allow_session:{}", request_id)
+                    }
+                ],
+                [
                     {
                         "text": "🚫 Deny",
                         "callback_data": format!("tool:deny:{}", request_id)
