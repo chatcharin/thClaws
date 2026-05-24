@@ -4392,6 +4392,8 @@ fn kind_has_credentials(kind: crate::providers::ProviderKind) -> bool {
     match kind {
         ProviderKind::AgentSdk => true,
         ProviderKind::Ollama | ProviderKind::OllamaAnthropic => true,
+        // LMStudio is a local OpenAI-compatible runtime — no API key needed
+        ProviderKind::LMStudio => true,
         other => other
             .api_key_env()
             .map(|v| std::env::var(v).is_ok())
