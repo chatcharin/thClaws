@@ -94,7 +94,13 @@ impl crate::telegram::handler::MessageHandler for TelegramWorkerHandler {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         let events_tx = self.events_tx.clone();
         let input_tx_self = self.input_tx_self.clone();
+        let approver = self.approver.clone();
         Box::pin(async move {
+            // Track active chat_id for approval prompts
+            if let Some(ref approver) = approver {
+                approver.set_active_chat_id(chat_id);
+            }
+            
             // Push the Telegram message into the worker loop
             if let Err(e) = input_tx_self.send(ShellInput::TelegramMessage {
                 chat_id,
@@ -137,7 +143,13 @@ impl crate::telegram::handler::MessageHandler for TelegramWorkerHandler {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         let events_tx = self.events_tx.clone();
         let input_tx_self = self.input_tx_self.clone();
+        let approver = self.approver.clone();
         Box::pin(async move {
+            // Track active chat_id for approval prompts
+            if let Some(ref approver) = approver {
+                approver.set_active_chat_id(chat_id);
+            }
+            
             // Try to download photos and convert to base64
             let mut images: Vec<(String, String)> = Vec::new();
             let mut download_failed = false;
@@ -202,7 +214,13 @@ impl crate::telegram::handler::MessageHandler for TelegramWorkerHandler {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         let events_tx = self.events_tx.clone();
         let input_tx_self = self.input_tx_self.clone();
+        let approver = self.approver.clone();
         Box::pin(async move {
+            // Track active chat_id for approval prompts
+            if let Some(ref approver) = approver {
+                approver.set_active_chat_id(chat_id);
+            }
+            
             // For now, treat document as text message
             // TODO: Download and process document
             let mime = mime_type.as_deref().unwrap_or("unknown");

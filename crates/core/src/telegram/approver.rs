@@ -101,6 +101,9 @@ pub struct TelegramApprover {
     pending: Arc<Mutex<Pending>>,
     /// Timeout before auto-denying.
     timeout: Duration,
+    /// Active chat_id for sending approval prompts.
+    /// Updated whenever a message is received from Telegram.
+    active_chat_id: Arc<Mutex<Option<i64>>>,
 }
 
 impl TelegramApprover {
@@ -111,6 +114,7 @@ impl TelegramApprover {
             client: Arc::new(tokio::sync::Mutex::new(client)),
             pending: Arc::new(Mutex::new(Pending::default())),
             timeout: DEFAULT_TIMEOUT,
+            active_chat_id: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -207,6 +211,18 @@ impl TelegramApprover {
         let mut guard = self.client.lock().await;
         *guard = Some(client);
     }
+
+    /// Update the active chat_id (called when a message is received).
+    pub fn set_active_chat_id(&self, chat_id: i64) {
+        if let Ok(mut guard) = self.active_chat_id.lock() {
+            *guard = Some(chat_id);
+        }
+    }
+
+    /// Get the active chat_id for sending approval prompts.
+    pub fn get_active_chat_id(&self) -> Option<i64> {
+        self.active_chat_id.lock().ok().and_then(|g| *g)
+    }
 }
 
 #[async_trait]
@@ -224,33 +240,27 @@ impl ApprovalSink for TelegramApprover {
             let prompt = Self::build_prompt(req);
             let buttons = Self::build_buttons(&request_id);
 
-            // We need chat_id to send the approval prompt.
-            // For now, we'll send to the first authorized chat_id.
-            // TODO: Track the active Telegram chat_id in state.
-            let config_path = crate::telegram::config::TelegramConfig::default_path();
-            if let Ok(cfg) = crate::telegram::config::TelegramConfig::load(&config_path) {
-                if let Some(&chat_id) = cfg.allowed_chat_ids.first() {
-                    let request = crate::telegram::protocol::SendMessageRequest {
-                        chat_id,
-                        text: prompt,
-                        parse_mode: Some("Markdown".to_string()),
-                        reply_markup: Some(buttons),
-                    };
+            // Get the active chat_id (set when user sends a message)
+            let chat_id = self.get_active_chat_id();
+            
+            if let Some(chat_id) = chat_id {
+                let request = crate::telegram::protocol::SendMessageRequest {
+                    chat_id,
+                    text: prompt,
+                    parse_mode: Some("Markdown".to_string()),
+                    reply_markup: Some(buttons),
+                };
 
-                    if let Err(e) = client.send_message(request).await {
-                        eprintln!("[telegram] approval prompt failed to send: {e}; auto-denying");
-                        self.pending
-                            .lock()
-                            .ok()
-                            .and_then(|mut p| p.take_by_id(&request_id));
-                        return ApprovalDecision::Deny;
-                    }
-                } else {
-                    eprintln!("[telegram] no authorized chat_ids; auto-denying approval");
+                if let Err(e) = client.send_message(request).await {
+                    eprintln!("[telegram] approval prompt failed to send: {e}; auto-denying");
+                    self.pending
+                        .lock()
+                        .ok()
+                        .and_then(|mut p| p.take_by_id(&request_id));
                     return ApprovalDecision::Deny;
                 }
             } else {
-                eprintln!("[telegram] config load failed; auto-denying approval");
+                eprintln!("[telegram] no active chat_id; auto-denying approval");
                 return ApprovalDecision::Deny;
             }
         } else {
