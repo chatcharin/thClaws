@@ -771,6 +771,9 @@ pub struct WorkerState {
     /// Plan-07 Phase 3: pre-Telegram-connect snapshot of the agent's
     /// permission mode, so TelegramDisconnect can restore.
     pub telegram_pre_mode: Option<crate::permissions::PermissionMode>,
+    /// Plan-07 Phase 3: pre-Telegram-connect snapshot of the approver,
+    /// so TelegramDisconnect can restore the original approver (GuiApprover or LineApprover).
+    pub telegram_pre_approver: Option<std::sync::Arc<dyn crate::permissions::ApprovalSink>>,
     /// Plan-07 Phase 3: Telegram approver for routing tool approvals
     /// to inline keyboard buttons.
     pub telegram_approver: Option<std::sync::Arc<crate::telegram::TelegramApprover>>,
@@ -1710,6 +1713,7 @@ async fn run_worker(
         line_pre_mode: None,
         line_pre_approver: None,
         telegram_pre_mode: None,
+        telegram_pre_approver: None,
         telegram_approver: None,
         telegram_poll_tx: None,
     };
@@ -2289,6 +2293,10 @@ async fn run_worker(
                         if state.telegram_pre_mode.is_none() {
                             state.telegram_pre_mode = Some(state.agent.permission_mode);
                         }
+                        // Save the pre-Telegram approver so we can restore it on disconnect
+                        if state.telegram_pre_approver.is_none() {
+                            state.telegram_pre_approver = Some(state.approver.clone());
+                        }
                         crate::permissions::set_current_mode_and_broadcast(
                             crate::permissions::PermissionMode::TelegramGated,
                         );
@@ -2357,15 +2365,16 @@ async fn run_worker(
                 }
                 // Clear the TelegramApprover
                 state.telegram_approver = None;
-                // Restore the previous approver (from LINE or local)
-                if let Some(prev_approver) = state.line_pre_approver.take() {
+                // Restore the previous approver (saved before Telegram connected)
+                if let Some(prev_approver) = state.telegram_pre_approver.take() {
                     state.approver = prev_approver;
                 }
                 if let Err(e) = state.rebuild_agent(true) {
                     eprintln!("[Telegram] rebuild_agent after disconnect failed: {e}");
                 }
                 
-                eprintln!("[Telegram] Disconnected");
+                eprintln!("[Telegram] Disconnected - restored permission_mode: {:?}", state.agent.permission_mode);
+                eprintln!("[Telegram] Disconnected - approver restored: {}", if std::sync::Arc::strong_count(&state.approver) > 0 { "yes" } else { "no" });
                 let _ = events_tx.send(ViewEvent::TelegramStatus(Ok(false)));
                 let _ = events_tx.send(ViewEvent::SlashOutput(
                     "[Telegram] bridge disconnected · permissions restored".into(),
