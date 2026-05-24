@@ -639,14 +639,26 @@ pub async fn dispatch(
                         Some("auto")
                     }
                     "ask" | "default" => {
+                        let prev_mode = state.agent.permission_mode;
                         state.agent.permission_mode = crate::permissions::PermissionMode::Ask;
                         crate::permissions::set_current_mode_and_broadcast(
                             crate::permissions::PermissionMode::Ask,
                         );
                         state.config.permissions = "ask".into();
+                        
+                        // If switching from TelegramGated, restore the original approver
+                        // so approval prompts appear locally (GUI modal) instead of Telegram
+                        if matches!(prev_mode, crate::permissions::PermissionMode::TelegramGated) {
+                            if let Some(original_approver) = state.telegram_pre_approver.clone() {
+                                state.approver = original_approver;
+                                eprintln!("[Permissions] Switched from TelegramGated to Ask - restored GUI approver");
+                            }
+                        }
+                        
                         Some("ask")
                     }
                     "reset" => {
+                        let prev_mode = state.agent.permission_mode;
                         // Reset permission mode to Ask and clear session trust flags
                         state.agent.permission_mode = crate::permissions::PermissionMode::Ask;
                         crate::permissions::set_current_mode_and_broadcast(
@@ -655,6 +667,15 @@ pub async fn dispatch(
                         // Clear any "allow for session" or "deny for session" state
                         state.approver.reset_session_flag();
                         let _ = crate::permissions::take_pre_plan_mode();
+                        
+                        // If switching from TelegramGated, restore the original approver
+                        if matches!(prev_mode, crate::permissions::PermissionMode::TelegramGated) {
+                            if let Some(original_approver) = state.telegram_pre_approver.clone() {
+                                state.approver = original_approver;
+                                eprintln!("[Permissions] Reset from TelegramGated to Ask - restored GUI approver");
+                            }
+                        }
+                        
                         emit(
                             events_tx,
                             "permissions reset → ask (session trust flags cleared)".into(),
