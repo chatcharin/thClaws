@@ -233,6 +233,9 @@ impl ApprovalSink for TelegramApprover {
         if let Ok(mut pending) = self.pending.lock() {
             pending.insert(request_id.clone(), tx);
         }
+        
+        eprintln!("[Telegram] Approval request: {} for tool: {}", request_id, req.tool_name);
+        eprintln!("[Telegram] Active chat_id: {:?}", self.get_active_chat_id());
 
         // Send approval prompt with inline keyboard
         let client_guard = self.client.lock().await;

@@ -2306,6 +2306,10 @@ async fn run_worker(
                         // Force the rebuilt agent into TelegramGated.
                         state.agent.permission_mode =
                             crate::permissions::PermissionMode::TelegramGated;
+                        
+                        eprintln!("[Telegram] Permission mode switched to TelegramGated");
+                        eprintln!("[Telegram] Agent permission_mode: {:?}", state.agent.permission_mode);
+                        eprintln!("[Telegram] Approver set: {}", if std::sync::Arc::strong_count(&state.approver) > 0 { "yes" } else { "no" });
 
                         // Spawn the polling loop
                         let handler = TelegramWorkerHandler {
