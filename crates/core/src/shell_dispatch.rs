@@ -646,8 +646,23 @@ pub async fn dispatch(
                         state.config.permissions = "ask".into();
                         Some("ask")
                     }
+                    "reset" => {
+                        // Reset permission mode to Ask and clear session trust flags
+                        state.agent.permission_mode = crate::permissions::PermissionMode::Ask;
+                        crate::permissions::set_current_mode_and_broadcast(
+                            crate::permissions::PermissionMode::Ask,
+                        );
+                        // Clear any "allow for session" or "deny for session" state
+                        state.approver.reset_session_flag();
+                        let _ = crate::permissions::take_pre_plan_mode();
+                        emit(
+                            events_tx,
+                            "permissions reset → ask (session trust flags cleared)".into(),
+                        );
+                        return;
+                    }
                     _ => {
-                        emit(events_tx, "usage: /permissions auto|ask".into());
+                        emit(events_tx, "usage: /permissions auto|ask|reset".into());
                         None
                     }
                 };

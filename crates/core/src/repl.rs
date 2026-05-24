@@ -6465,6 +6465,17 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                                 );
                                 println!("{COLOR_DIM}permissions → ask{COLOR_RESET}");
                             }
+                            "reset" => {
+                                // Reset permission mode to Ask and clear session trust flags
+                                agent.permission_mode = PermissionMode::Ask;
+                                crate::permissions::set_current_mode_and_broadcast(
+                                    PermissionMode::Ask,
+                                );
+                                // Clear any "allow for session" or "deny for session" state
+                                crate::permissions::ApprovalSink::reset_session_flag(approver.as_ref());
+                                let _ = crate::permissions::take_pre_plan_mode();
+                                println!("{COLOR_DIM}permissions reset → ask (session trust flags cleared){COLOR_RESET}");
+                            }
                             "linegated" => {
                                 agent.permission_mode = PermissionMode::LineGated;
                                 crate::permissions::set_current_mode_and_broadcast(
@@ -6480,7 +6491,7 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                                 println!("{COLOR_DIM}permissions → telegramgated (approvals via Telegram){COLOR_RESET}");
                             }
                             _ => {
-                                println!("{COLOR_YELLOW}usage: /permissions auto|ask|linegated|telegramgated{COLOR_RESET}");
+                                println!("{COLOR_YELLOW}usage: /permissions auto|ask|reset|linegated|telegramgated{COLOR_RESET}");
                             }
                         }
                     }
