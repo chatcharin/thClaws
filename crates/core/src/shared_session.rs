@@ -2316,7 +2316,7 @@ async fn run_worker(
                             crate::telegram::TelegramApprover::new(None)
                         );
                         state.telegram_approver = Some(telegram_approver.clone());
-                        state.approver = telegram_approver as std::sync::Arc<dyn crate::permissions::ApprovalSink>;
+                        state.approver = telegram_approver.clone() as std::sync::Arc<dyn crate::permissions::ApprovalSink>;
                         
                         if let Err(e) = state.rebuild_agent(true) {
                             eprintln!("[Telegram] rebuild_agent after mode swap failed: {e}");
@@ -2339,6 +2339,14 @@ async fn run_worker(
                             eprintln!("[Telegram] Failed to start polling: {}", e);
                             let _ = events_tx.send(ViewEvent::TelegramStatus(Err(e)));
                         } else {
+                            // IMPORTANT: Update TelegramApprover with the client reference
+                            // so it can send approval prompts
+                            let client_arc = bridge.get_client();
+                            let client_guard = client_arc.lock().await;
+                            telegram_approver.update_client(client_guard.clone()).await;
+                            eprintln!("[Telegram] Approver client updated");
+                            drop(client_guard);
+                            
                             eprintln!("[Telegram] Polling started");
                             // Register bot commands for autocomplete
                             if let Err(e) = bridge.register_commands().await {

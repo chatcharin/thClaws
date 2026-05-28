@@ -1,0 +1,64 @@
+Phase,ระยะเวลา (เดือน),จำนวนวัน,หัวข้อหลัก,รายการงาน,รายละเอียด/หมายเหตุ,Status,Due Date
+1,1.5,45,1 – RAG Upgrade,Multi-type Loader (DOCX, XLSX, PPTX, PDF, images),รองรับ PDF แล้ว,Done,
+1,1.5,45,1 – RAG Upgrade,OCR fallback (Typhoon OCR) ถ้าไม่มี Service OCR ให้ใช้ Tesseract,,Done,
+1,1.5,45,1 – RAG Upgrade,Editable Ingestion – API to edit a stored chunk (typo fix, content update),,Test,
+1,1.5,45,1 – RAG Upgrade,Chunk & Filter Config (size, overlap, language filter),,Done,
+1,1.5,45,1 – RAG Upgrade,Knowledge base – Top status Doc process,,Done,
+1,1.5,45,1 – RAG Upgrade,Knowledge base – General,,Done,
+1,1.5,45,1 – RAG Upgrade,Knowledge base – Model,,Done,
+1,1.5,45,1 – RAG Upgrade,Knowledge base – Permissions,,Done,
+1,1.5,45,1 – RAG Upgrade,Knowledge base – Data Masking,,Done,
+1,1.5,45,1 – RAG Upgrade,Knowledge base – Parsing (ใช้ Typhoon เป็นหลัก การตั้งค่าอาจไม่เหมือนกัน),,Done,
+1,1.5,45,1 – RAG Upgrade,Knowledge base – Chunking (ตั้งค่าไว้ใน code แต่อาจตั้งค่าไม่ได้เหมือน UI),,Done,
+1,1.5,45,1 – RAG Upgrade,Knowledge base – Edit View Document data (Markdown),,Done,
+2,1.5,45,2 – Workspace,Workspace Profile,,Done,
+2,1.5,45,2 – Workspace,Permission – Content View,,Done,
+2,1.5,45,2 – Workspace,AI,,Done,
+3,1.5,45,3 – Multi-Channel Integration,Line OA webhook & OAuth token management,,Done,
+3,1.5,45,3 – Multi-Channel Integration,Facebook Messenger webhook,ลงทะเบียน Business Account – รอ,Wait
+3,1.5,45,3 – Multi-Channel Integration,Instagram Direct API wrapper,ลงทะเบียน Business Account – รอ,Wait
+3,1.5,45,3 – Multi-Channel Integration,Web Widget (simple JS embed + REST endpoint),,Done
+3,1.5,45,3 – Multi-Channel Integration,Unified Chat DB,,Done
+3,1.5,45,3 – Multi-Channel Integration,Customer Data Capture (name, email, consent) Link,,Done
+3,1.5,45,3 – Multi-Channel Integration,Account Management UI (add/remove channel accounts),,Done
+3,1.5,45,3 – Multi-Channel Integration,List Card integration – Facebook – Connect,,Done
+3,1.5,45,3 – Multi-Channel Integration,List Card integration – Facebook – General,,Done
+3,1.5,45,3 – Multi-Channel Integration,List Card integration – Facebook – Permissions,,Done
+3,1.5,45,3 – Multi-Channel Integration,List Card integration – Line – Connect,,Done
+3,1.5,45,3 – Multi-Channel Integration,List Card integration – Line – General,,Done
+3,1.5,45,3 – Multi-Channel Integration,List Card integration – Line – Permissions,,Done
+3,1.5,45,3 – Multi-Channel Integration,Web Chat widget – Setting,,Done
+4,1.5,45,4 – Conversation,Chat Conversation – My Inbox,,Done
+4,1.5,45,4 – Conversation,Chat Conversation – All Chats,,Done
+4,1.5,45,4 – Conversation,Chat Conversation – Unassigned,,Done
+4,1.5,45,4 – Conversation,Chat Conversation – Filters (Follow ups, Unread Chat),,Done
+4,1.5,45,4 – Conversation,Chat Conversation – Spam,,Done
+5,1.5,45,5 – Agent Config Refactor,tune prompts, tools, safety, background processing,,Done
+5,1.5,45,5 – Agent Config Refactor,Agent List view / Card View,,Test
+5,1.5,45,5 – Agent Config Refactor,Agent Conversation,,Done
+5,1.5,45,5 – Agent Config Refactor,Create Agent – General,,Done
+5,1.5,45,5 – Agent Config Refactor,Create Agent – Model,,Done
+5,1.5,45,5 – Agent Config Refactor,Create Agent – Permissions,,Done
+5,1.5,45,5 – Agent Config Refactor,Create Agent – Knowledge base,,Done
+5,1.5,45,5 – Agent Config Refactor,Create Agent – Configure Prompt,,Done
+5,1.5,45,5 – Agent Config Refactor,Create Agent – Query Understanding,,Done
+5,1.5,45,5 – Agent Config Refactor,Create Agent – Data Masking (ดู Model ที่มีความสามารถ),,Test
+5,1.5,45,5 – Agent Config Refactor,Create Agent – Retrieval (ใช้ embedding เดียวกัน, Rerank แยกทำทีหลัง),,Test
+5,1.5,45,5 – Agent Config Refactor,Create Agent – Rerank (แยกทำเดือนที่ 4 หรือถ้าทัน),,Test
+5,1.5,45,5 – Agent Config Refactor,Create Agent – Filter,,Done
+5,1.5,45,5 – Agent Config Refactor,Create Agent – Generation (ตั้งค่าตาม model API/opensource),,Done
+5,1.5,45,5 – Agent Config Refactor,Create Agent – Translation (ใช้ model ตัวเล็กช่วย),,Done
+5,1.5,45,5 – Agent Config Refactor,Create Agent – User Experience (ตั้งค่าตาม model API/opensource),,Done
+6,1.5,45,6 – Logging, metrics, Security,OWASP Top 10 latest version,,Done
+7,1.5,45,7 – Rerank ของ Embedding,อาจจะต้องหาเวลาทำ,,Test
+,,,Summary,,,
+,,,,,1. ปรับปรุงระบบ RAG ที่มีอยู่เดิม รองรับ OCR และเอกสารอื่นๆ (Excel, DOC, PPT),,
+,,,,,2. เพิ่มการแก้ไขข้อมูลที่เก็บไว้จากหน้าเอกสาร (แก้คำผิด ฯลฯ),,
+,,,,,3. ตั้งค่า Knowledge base, filter chunk และอื่นๆ,,
+,,,,,4. Workspace,,
+,,,,,5. Integration กับ Line OA, Facebook Messenger, Instagram, Web widget,,
+,,,,,6. Conversation รองรับหลาย channel พร้อมเก็บข้อมูล Customer,,
+,,,,,7. ปรับตั้งค่า Agent และการทำงานเบื้องหลัง,,
+,,,,,8. ปรับปรุง Knowledge base รองรับ Data Masking Role,,
+,,,,,9. อนาคต: ปรับเรื่อง Rerank ของ Embedding,,
+,,,,,ส่วนเพิ่มเติม (Phase ถัดไป 1.5 เดือน): Packet, Payment, Billing, Shopee, Lazada, TikTok – หยุดไว้ก่อน Focus แก้ Bug และทำส่วนที่ยังไม่เสร็จให้เรียบร้อยก่อน,

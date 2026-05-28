@@ -65,6 +65,11 @@ impl TelegramBridge {
         self.running.load(Ordering::SeqCst)
     }
 
+    /// Get a reference to the TelegramClient (for approval prompts).
+    pub fn get_client(&self) -> Arc<Mutex<TelegramClient>> {
+        self.client.clone()
+    }
+
     /// Validate bot token via getMe API call.
     pub async fn validate_token(&self, token: &str) -> Result<String, String> {
         let mut client = self.client.lock().await;

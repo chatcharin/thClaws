@@ -13,6 +13,7 @@ use serde::Serialize;
 use serde_json;
 
 /// Telegram Bot API client.
+#[derive(Clone)]
 pub struct TelegramClient {
     base_url: String,
     client: Client,
