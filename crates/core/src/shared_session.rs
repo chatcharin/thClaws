@@ -210,6 +210,7 @@ impl crate::telegram::handler::MessageHandler for TelegramWorkerHandler {
         chat_id: i64,
         file_name: String,
         mime_type: Option<String>,
+        file_url: String,
         from: Option<crate::telegram::protocol::User>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         let events_tx = self.events_tx.clone();
@@ -221,14 +222,14 @@ impl crate::telegram::handler::MessageHandler for TelegramWorkerHandler {
                 approver.set_active_chat_id(chat_id);
             }
             
-            // For now, treat document as text message
-            // TODO: Download and process document
-            let mime = mime_type.as_deref().unwrap_or("unknown");
-            let text = format!("[Document: {} ({})]", file_name, mime);
-            eprintln!("[Telegram] Document message: {}", text);
-            if let Err(e) = input_tx_self.send(ShellInput::TelegramMessage {
+            eprintln!("[Telegram] Document received: {} ({})", file_name, mime_type.as_deref().unwrap_or("unknown"));
+            
+            // Send document info to worker, which will download and save to working directory
+            if let Err(e) = input_tx_self.send(ShellInput::TelegramDocument {
                 chat_id,
-                text,
+                file_name,
+                file_path: file_url, // Worker will use this URL to download
+                mime_type,
                 from,
             }) {
                 eprintln!("[Telegram] Failed to push document message to worker: {}", e);
@@ -362,6 +363,15 @@ pub enum ShellInput {
         chat_id: i64,
         text: String,
         images: Vec<(String, String)>, // (media_type, base64_data)
+        from: Option<crate::telegram::protocol::User>,
+    },
+    /// Incoming Telegram document (Excel, PDF, etc.).
+    /// File is downloaded to working directory so agent can access it.
+    TelegramDocument {
+        chat_id: i64,
+        file_name: String,
+        file_path: String, // Local path in working directory
+        mime_type: Option<String>,
         from: Option<crate::telegram::protocol::User>,
     },
 }
@@ -2759,6 +2769,45 @@ async fn run_worker(
                     }
                 }
             }
+            // TelegramDocument — incoming document (Excel, PDF, etc.)
+            // Download file to working directory and notify agent
+            ShellInput::TelegramDocument { chat_id, file_name, file_path: file_url, mime_type, from } => {
+                eprintln!("[Telegram] Processing document: {} ({})", file_name, mime_type.as_deref().unwrap_or("unknown"));
+                
+                // Download file to working directory
+                let download_result = download_file_to_working_directory(&file_url, &file_name).await;
+                
+                match download_result {
+                    Ok(local_path) => {
+                        eprintln!("[Telegram] Document saved to working directory: {}", local_path);
+                        
+                        // Send text message to agent with file path
+                        let text = format!("[Document uploaded: {}]\n\nFile saved to: `{}`\n\nYou can now read this file using the appropriate tool (XlsxRead for Excel, PdfRead for PDF, etc.).", file_name, local_path);
+                        
+                        if let Err(e) = input_tx_self.send(ShellInput::TelegramMessage {
+                            chat_id,
+                            text,
+                            from,
+                        }) {
+                            eprintln!("[Telegram] Failed to push document message to worker: {}", e);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[Telegram] Failed to download document: {}", e);
+                        
+                        // Send error message to user
+                        let text = format!("[Document upload failed: {}]\n\nError: {}", file_name, e);
+                        
+                        if let Err(e) = input_tx_self.send(ShellInput::TelegramMessage {
+                            chat_id,
+                            text,
+                            from,
+                        }) {
+                            eprintln!("[Telegram] Failed to push error message: {}", e);
+                        }
+                    }
+                }
+            }
             ShellInput::McpAppCallTool {
                 request_id,
                 qualified_name,
@@ -4995,4 +5044,65 @@ async fn download_image_as_base64(url: &str) -> Result<(String, String), String>
     eprintln!("[Telegram] Image downloaded: {} bytes, media_type={}", bytes.len(), media_type);
     
     Ok((media_type, base64_data))
+}
+
+/// Download a file from URL and save to working directory.
+/// Returns the local file path.
+async fn download_file_to_working_directory(url: &str, file_name: &str) -> Result<String, String> {
+    use std::path::PathBuf;
+    
+    eprintln!("[Telegram] Downloading file to working directory: {} ({})", file_name, url);
+    
+    // Get working directory from current session
+    let cwd = std::env::current_dir().map_err(|e| format!("Failed to get cwd: {}", e))?;
+    
+    // Sanitize file name to prevent path traversal
+    let safe_name = PathBuf::from(file_name)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "downloaded_file".to_string());
+    
+    let dest_path = cwd.join(&safe_name);
+    
+    // If file already exists, add a suffix to avoid overwriting
+    let dest_path = if dest_path.exists() {
+        let stem = PathBuf::from(&safe_name)
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let ext = PathBuf::from(&safe_name)
+            .extension()
+            .map(|e| format!(".{}", e.to_string_lossy()))
+            .unwrap_or_default();
+        
+        let mut counter = 1;
+        loop {
+            let new_name = format!("{}{}{}", stem, counter, ext);
+            let new_path = cwd.join(&new_name);
+            if !new_path.exists() {
+                break new_path;
+            }
+            counter += 1;
+        }
+    } else {
+        dest_path
+    };
+    
+    // Download file
+    let client = reqwest::Client::new();
+    let response = client.get(url).send().await.map_err(|e| e.to_string())?;
+    
+    if !response.status().is_success() {
+        return Err(format!("Failed to download file: HTTP {}", response.status()));
+    }
+    
+    let bytes = response.bytes().await.map_err(|e| e.to_string())?;
+    
+    // Write to working directory
+    std::fs::write(&dest_path, &bytes).map_err(|e| format!("Failed to write file: {}", e))?;
+    
+    let local_path = dest_path.to_string_lossy().to_string();
+    eprintln!("[Telegram] File downloaded to: {} ({} bytes)", local_path, bytes.len());
+    
+    Ok(local_path)
 }

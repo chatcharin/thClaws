@@ -28,7 +28,7 @@ pub trait MessageHandler: Send + Sync {
     }
 
     /// Handle an incoming document (download and process).
-    fn on_document(&self, _chat_id: i64, _file_name: String, _mime_type: Option<String>, _from: Option<User>) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+    fn on_document(&self, _chat_id: i64, _file_name: String, _mime_type: Option<String>, _file_url: String, _from: Option<User>) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         Box::pin(async {})
     }
 }

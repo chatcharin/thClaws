@@ -155,7 +155,8 @@ impl TelegramPollingLoop {
             let client_guard = self.client.lock().await;
             if let Ok(file_url) = client_guard.get_file_url(&doc.file_id).await {
                 drop(client_guard);
-                self.handler.on_document(chat_id, doc.file_name.clone(), doc.mime_type.clone(), from).await;
+                // Pass file_url to handler so it can download the file
+                self.handler.on_document(chat_id, doc.file_name.clone(), doc.mime_type.clone(), file_url, from).await;
                 return;
             }
             drop(client_guard);
