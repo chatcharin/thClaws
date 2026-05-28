@@ -6459,13 +6459,25 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                                 println!("{COLOR_DIM}permissions → auto (no prompts){COLOR_RESET}");
                             }
                             "ask" | "default" => {
+                                let prev_mode = agent.permission_mode;
                                 agent.permission_mode = PermissionMode::Ask;
                                 crate::permissions::set_current_mode_and_broadcast(
                                     PermissionMode::Ask,
                                 );
+                                
+                                // If switching from TelegramGated, rebuild agent with ReplApprover
+                                // so approval prompts appear locally instead of Telegram
+                                if matches!(prev_mode, PermissionMode::TelegramGated) {
+                                    // Create a fresh ReplApprover for local prompts
+                                    let repl_approver = std::sync::Arc::new(crate::permissions::ReplApprover::default());
+                                    agent = agent.with_approver(repl_approver.clone());
+                                    eprintln!("[Permissions] Switched from TelegramGated to Ask - restored REPL approver");
+                                }
+                                
                                 println!("{COLOR_DIM}permissions → ask{COLOR_RESET}");
                             }
                             "reset" => {
+                                let prev_mode = agent.permission_mode;
                                 // Reset permission mode to Ask and clear session trust flags
                                 agent.permission_mode = PermissionMode::Ask;
                                 crate::permissions::set_current_mode_and_broadcast(
@@ -6474,6 +6486,14 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                                 // Clear any "allow for session" or "deny for session" state
                                 crate::permissions::ApprovalSink::reset_session_flag(approver.as_ref());
                                 let _ = crate::permissions::take_pre_plan_mode();
+                                
+                                // If switching from TelegramGated, rebuild agent with ReplApprover
+                                if matches!(prev_mode, PermissionMode::TelegramGated) {
+                                    let repl_approver = std::sync::Arc::new(crate::permissions::ReplApprover::default());
+                                    agent = agent.with_approver(repl_approver.clone());
+                                    eprintln!("[Permissions] Reset from TelegramGated to Ask - restored REPL approver");
+                                }
+                                
                                 println!("{COLOR_DIM}permissions reset → ask (session trust flags cleared){COLOR_RESET}");
                             }
                             "linegated" => {
