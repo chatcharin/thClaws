@@ -4,11 +4,13 @@
 //! recurring jobs. Each job carries its own working directory, prompt,
 //! optional model/iteration overrides, and a standard 5-field cron
 //! expression. `run_once` fires a single job synchronously by spawning
-//! `thclaws --print "<prompt>"` with `current_dir(<cwd>)`, capturing
-//! stdout+stderr to a per-run log file under
-//! `~/.local/share/thclaws/logs/<id>/<ts>.log`, and recording the exit
-//! code + duration back into the schedule entry's `last_run` /
-//! `last_exit` fields.
+//! `thclaws --print "<prompt>"` with `current_dir(<cwd>)`. The job's
+//! clean output (stdout — the agent's final answer) is auto-saved into
+//! the WORKSPACE at `<cwd>/.thclaws/schedule/<id>/<ts>.md` so the user
+//! can open the result in the Files tab; stderr (the MCP banner,
+//! warnings, errors) goes to a separate diagnostic log under
+//! `~/.local/share/thclaws/logs/<id>/<ts>.log`. The exit code + duration
+//! are recorded back into the schedule entry's `last_run` / `last_exit`.
 //!
 //! Step 1 is intentionally **without an in-process scheduler** — the
 //! `run` subcommand fires a single job by id, so users can wire it
@@ -17,7 +19,7 @@
 //! verbatim — only the trigger changes.
 
 use crate::error::{Error, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -49,8 +51,22 @@ pub struct Schedule {
     /// Standard 5-field POSIX cron expression. Validated on add (the
     /// `cron` crate parses it; an error message names the offending
     /// field). Stored as-is so users see exactly what they typed when
-    /// they `show` the entry.
+    /// they `show` the entry. Empty for a one-shot schedule (see
+    /// `run_at`), where it is ignored.
     pub cron: String,
+
+    /// One-shot fire time as an RFC 3339 timestamp. When set, this
+    /// entry is a one-off: it fires once at/after `run_at`, then
+    /// auto-disables (`enabled = false`), and `cron` is ignored.
+    /// Mutually exclusive with a non-empty `cron` at add time.
+    ///
+    /// Catch-up by design: a `run_at` already in the past when the
+    /// scheduler ticks (e.g. the daemon was down over the slot) fires
+    /// immediately rather than being lost — the one thing a bare cron
+    /// expression can't express ("once on May 24 15:30" re-matches the
+    /// following year, and a missed minute is gone until then).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_at: Option<String>,
 
     /// Absolute working directory the spawned `--print` job runs in.
     /// This is what determines which `.thclaws/settings.json`,
@@ -69,6 +85,13 @@ pub struct Schedule {
     /// process resolves it through the same alias path the CLI uses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// dev-plan/heartbeat: chain fires into ONE session instead of a fresh
+    /// amnesiac run each time. Passed to the spawned job as
+    /// `--resume <value>`. Use `"last"` (recommended — resumes the cwd's
+    /// most-recent session; the first fire starts it) or an existing
+    /// session id. `None` keeps the classic stateless behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_session: Option<String>,
 
     /// Cap on the agent loop's tool-call iterations for this job.
     /// `None` falls through to the project's `maxIterations` setting
@@ -203,7 +226,7 @@ impl ScheduleStore {
                 schedule.id, schedule.id
             )));
         }
-        validate_cron(&schedule.cron)?;
+        validate_trigger(&schedule)?;
         self.schedules.push(schedule);
         Ok(())
     }
@@ -214,6 +237,80 @@ impl ScheduleStore {
         self.schedules.retain(|s| s.id != id);
         before != self.schedules.len()
     }
+}
+
+/// Validate a schedule's trigger at add time: exactly one of `cron`
+/// or `run_at` must be set. A one-shot (`run_at` set) must carry a
+/// parseable RFC 3339 timestamp and an empty `cron`; a recurring
+/// entry must carry a valid cron expression and no `run_at`.
+pub fn validate_trigger(schedule: &Schedule) -> Result<()> {
+    let has_cron = !schedule.cron.trim().is_empty();
+    match &schedule.run_at {
+        Some(ts) => {
+            if has_cron {
+                return Err(Error::Config(
+                    "a schedule is either recurring (--cron) or one-shot \
+                     (--at/--in), not both"
+                        .into(),
+                ));
+            }
+            parse_run_at(ts).map(|_| ())
+        }
+        None => {
+            if !has_cron {
+                return Err(Error::Config(
+                    "a schedule needs a trigger: pass --cron for recurring, \
+                     or --at/--in for a one-shot"
+                        .into(),
+                ));
+            }
+            validate_cron(&schedule.cron)
+        }
+    }
+}
+
+/// Parse a one-shot `run_at` RFC 3339 timestamp into UTC. Accepts any
+/// offset (`Z`, `+07:00`, …) and normalizes to UTC so the tick loop
+/// compares against `Utc::now()`.
+pub fn parse_run_at(ts: &str) -> Result<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(ts.trim())
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|e| {
+            Error::Config(format!(
+                "invalid --at timestamp '{ts}': {e} (expected RFC 3339, \
+                 e.g. 2026-05-24T15:30:00Z or 2026-05-24T22:30:00+07:00)"
+            ))
+        })
+}
+
+/// Parse a relative `--in` duration like `15m`, `2h`, `90s`, `1d`
+/// into a `chrono::Duration`. A bare integer is treated as seconds.
+/// Used to turn `--in <dur>` into an absolute `run_at = now + dur`.
+pub fn parse_relative_duration(s: &str) -> Result<chrono::Duration> {
+    let s = s.trim();
+    let bad = || {
+        Error::Config(format!(
+            "invalid --in duration '{s}': use forms like 15m, 2h, 90s, 1d"
+        ))
+    };
+    let (num, unit_secs) = match s.chars().last() {
+        Some('s') => (&s[..s.len() - 1], 1_i64),
+        Some('m') => (&s[..s.len() - 1], 60),
+        Some('h') => (&s[..s.len() - 1], 3_600),
+        Some('d') => (&s[..s.len() - 1], 86_400),
+        Some(c) if c.is_ascii_digit() => (s, 1),
+        _ => return Err(bad()),
+    };
+    let value: i64 = num.trim().parse().map_err(|_| bad())?;
+    if value <= 0 {
+        return Err(Error::Config(format!(
+            "invalid --in duration '{s}': must be a positive amount of time"
+        )));
+    }
+    value
+        .checked_mul(unit_secs)
+        .map(chrono::Duration::seconds)
+        .ok_or_else(bad)
 }
 
 /// Validate a cron expression at add time. Uses the `cron` crate
@@ -244,6 +341,13 @@ fn normalize_cron(expr: &str) -> String {
 /// killed by the timeout enforcer or never produced a status.
 #[derive(Debug, Clone)]
 pub struct RunOutcome {
+    /// The run's clean output (the agent's final answer) — captured
+    /// stdout, written into the workspace at
+    /// `<cwd>/.thclaws/schedule/<id>/<ts>.md` so the user can open it in
+    /// the Files tab without digging into `~/.local/share`.
+    pub result_path: PathBuf,
+    /// Diagnostics for this run (captured stderr: MCP banner, warnings,
+    /// errors) under `~/.local/share/thclaws/logs/<id>/<ts>.log`.
     pub log_path: PathBuf,
     pub exit_code: Option<i32>,
     pub duration: Duration,
@@ -303,6 +407,11 @@ pub fn run_once_with(
     if let Some(entry) = store.get_mut(id) {
         entry.last_run = Some(Utc::now().to_rfc3339());
         entry.last_exit = outcome.exit_code;
+        // One-shots fire exactly once: disable after the first run so
+        // the tick loop's `enabled` filter never re-fires it.
+        if entry.run_at.is_some() {
+            entry.enabled = false;
+        }
     }
     match store_path {
         Some(p) => store.save_to(p)?,
@@ -320,20 +429,37 @@ fn spawn_job(schedule: &Schedule, binary_path: &Path) -> Result<RunOutcome> {
     let ts = Utc::now().format("%Y-%m-%dT%H-%M-%SZ").to_string();
     let log_path = log_dir.join(format!("{ts}.log"));
     let log_file = std::fs::File::create(&log_path)?;
-    // stderr piped into the same file as stdout so the run log is
-    // a single linear trace; matches what a user would see in the
-    // terminal.
-    let log_file_for_err = log_file.try_clone()?;
+
+    // The RESULT (stdout = the agent's final answer; print mode already
+    // suppresses ANSI/thinking when not a TTY) is auto-saved into the
+    // WORKSPACE so the user can view it in the Files tab regardless of
+    // what the prompt was — no need to ask the agent to "save to a file".
+    // Diagnostics (stderr: the MCP banner, warnings, errors) go to the
+    // separate log under ~/.local/share so the result file stays clean.
+    let result_dir = schedule
+        .cwd
+        .join(".thclaws")
+        .join("state")
+        .join("schedule")
+        .join(&schedule.id);
+    std::fs::create_dir_all(&result_dir)?;
+    let result_path = result_dir.join(format!("{ts}.md"));
+    let result_file = std::fs::File::create(&result_path)?;
 
     let mut cmd = Command::new(binary_path);
     cmd.arg("--print")
         .arg(&schedule.prompt)
         .current_dir(&schedule.cwd)
         .stdin(Stdio::null())
-        .stdout(Stdio::from(log_file))
-        .stderr(Stdio::from(log_file_for_err));
+        .stdout(Stdio::from(result_file))
+        .stderr(Stdio::from(log_file));
     if let Some(ref m) = schedule.model {
         cmd.arg("--model").arg(m);
+    }
+    // Heartbeat: continue the same session across fires. Print mode now
+    // persists sessions + honors --resume, so history accumulates.
+    if let Some(ref sid) = schedule.resume_session {
+        cmd.arg("--resume").arg(sid);
     }
     if let Some(n) = schedule.max_iterations {
         cmd.arg("--max-iterations").arg(n.to_string());
@@ -370,6 +496,7 @@ fn spawn_job(schedule: &Schedule, binary_path: &Path) -> Result<RunOutcome> {
     };
 
     Ok(RunOutcome {
+        result_path,
         log_path,
         exit_code,
         duration: started.elapsed(),
@@ -413,6 +540,19 @@ pub fn log_dir_for(id: &str) -> Result<PathBuf> {
     Ok(home.join(".local/share/thclaws/logs").join(id))
 }
 
+/// Newest diagnostic log for a schedule, if any. Each fire writes one
+/// timestamped `<ts>.log` (its stderr — where the actual error is), so the
+/// lexicographically-largest name is the most recent fire's log. Used by
+/// `schedule status` to point the user at the error behind an `err`.
+pub fn latest_log(id: &str) -> Option<PathBuf> {
+    let dir = log_dir_for(id).ok()?;
+    std::fs::read_dir(&dir)
+        .ok()?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "log"))
+        .max_by(|a, b| a.file_name().cmp(&b.file_name()))
+}
+
 // ─── Step 2: in-process scheduler ────────────────────────────────────
 //
 // Long-running tokio task that polls the schedule store every
@@ -447,13 +587,45 @@ pub fn parse_last_run(schedule: &Schedule) -> Option<DateTime<Utc>> {
         .map(|d| d.with_timezone(&Utc))
 }
 
+/// Format a last-run timestamp for display in the local timezone.
+/// Returns `never` when the field is absent and preserves the raw
+/// string if parsing fails.
+pub fn display_last_run(last_run: Option<&str>) -> String {
+    last_run
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&Local).to_rfc3339())
+        .unwrap_or_else(|| last_run.unwrap_or("never").to_string())
+}
+
 /// First cron fire strictly after `after`. Returns `None` if the
 /// expression is invalid or has no upcoming fire (rare — e.g. a
 /// `cron` expression pinned to a specific year that's already past).
 pub fn compute_next_fire(cron_expr: &str, after: DateTime<Utc>) -> Option<DateTime<Utc>> {
     let normalized = normalize_cron(cron_expr);
     let schedule = cron::Schedule::from_str(&normalized).ok()?;
-    schedule.after(&after).next()
+    schedule
+        .after(&after.with_timezone(&Local))
+        .next()
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
+/// Next time `schedule` is due relative to `cursor`, unifying the
+/// recurring and one-shot cases for the tick loop.
+///
+/// - One-shot (`run_at` set): returns the `run_at` instant until the
+///   job has fired (`last_run` recorded), then `None`. The `cursor`
+///   is ignored — a one-shot's due time is absolute, so a `run_at`
+///   in the past returns immediately (caught up) rather than being
+///   skipped past.
+/// - Recurring: delegates to `compute_next_fire(cron, cursor)`.
+pub fn next_fire(schedule: &Schedule, cursor: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    if let Some(run_at) = &schedule.run_at {
+        if schedule.last_run.is_some() {
+            return None; // one-shot already fired
+        }
+        return parse_run_at(run_at).ok();
+    }
+    compute_next_fire(&schedule.cron, cursor)
 }
 
 /// First N cron fires strictly after `after`. Returns an empty Vec
@@ -465,7 +637,11 @@ pub fn compute_next_n_fires(cron_expr: &str, after: DateTime<Utc>, n: usize) -> 
     let Ok(schedule) = cron::Schedule::from_str(&normalized) else {
         return Vec::new();
     };
-    schedule.after(&after).take(n).collect()
+    schedule
+        .after(&after.with_timezone(&Local))
+        .take(n)
+        .map(|dt| dt.with_timezone(&Utc))
+        .collect()
 }
 
 /// In-process scheduler state. Owns the per-schedule cursor map and
@@ -532,7 +708,7 @@ impl InProcessScheduler {
                 .entry(schedule.id.clone())
                 .or_insert_with(|| parse_last_run(schedule).unwrap_or(now));
 
-            let Some(next) = compute_next_fire(&schedule.cron, cursor) else {
+            let Some(next) = next_fire(schedule, cursor) else {
                 continue;
             };
             if next > now {
@@ -568,9 +744,10 @@ impl InProcessScheduler {
                             .unwrap_or_else(|| "(timeout)".to_string());
                         eprintln!(
                             "\x1b[36m[schedule] '{id_for_task}' fired \
-                             — exit={exit} duration={}.{:03}s log={}\x1b[0m",
+                             — exit={exit} duration={}.{:03}s → result={} (log={})\x1b[0m",
                             outcome.duration.as_secs(),
                             outcome.duration.subsec_millis(),
+                            outcome.result_path.display(),
                             outcome.log_path.display(),
                         );
                     }
@@ -1323,9 +1500,10 @@ impl WatchManager {
                                     .map(|c| c.to_string())
                                     .unwrap_or_else(|| "(timeout)".into());
                                 eprintln!(
-                                    "\x1b[36m[watch] '{id_for_blocking}' done — exit={exit} duration={}.{:03}s log={}\x1b[0m",
+                                    "\x1b[36m[watch] '{id_for_blocking}' done — exit={exit} duration={}.{:03}s → result={} (log={})\x1b[0m",
                                     o.duration.as_secs(),
                                     o.duration.subsec_millis(),
+                                    o.result_path.display(),
                                     o.log_path.display(),
                                 );
                             }
@@ -1394,6 +1572,140 @@ mod tests {
         assert!(validate_cron("99 * * * *").is_err()); // out of range
     }
 
+    // ─── one-shot / relative-delay schedules ───
+
+    #[test]
+    fn validate_trigger_enforces_exactly_one() {
+        let cron_only = Schedule {
+            cron: "* * * * *".into(),
+            ..Default::default()
+        };
+        assert!(validate_trigger(&cron_only).is_ok());
+
+        let one_shot = Schedule {
+            cron: String::new(),
+            run_at: Some("2026-05-24T15:30:00Z".into()),
+            ..Default::default()
+        };
+        assert!(validate_trigger(&one_shot).is_ok());
+
+        // Both set → rejected.
+        let both = Schedule {
+            cron: "* * * * *".into(),
+            run_at: Some("2026-05-24T15:30:00Z".into()),
+            ..Default::default()
+        };
+        assert!(validate_trigger(&both).is_err());
+
+        // Neither set → rejected.
+        let neither = Schedule {
+            cron: String::new(),
+            ..Default::default()
+        };
+        assert!(validate_trigger(&neither).is_err());
+
+        // run_at set but unparseable → rejected.
+        let bad_at = Schedule {
+            run_at: Some("tomorrow morning".into()),
+            ..Default::default()
+        };
+        assert!(validate_trigger(&bad_at).is_err());
+    }
+
+    #[test]
+    fn parse_run_at_accepts_rfc3339_offsets() {
+        let z = parse_run_at("2026-05-24T15:30:00Z").unwrap();
+        let off = parse_run_at("2026-05-24T22:30:00+07:00").unwrap();
+        // Both denote the same instant, normalized to UTC.
+        assert_eq!(z, off);
+        assert!(parse_run_at("not a time").is_err());
+    }
+
+    #[test]
+    fn parse_relative_duration_units() {
+        use chrono::Duration;
+        assert_eq!(
+            parse_relative_duration("90s").unwrap(),
+            Duration::seconds(90)
+        );
+        assert_eq!(
+            parse_relative_duration("15m").unwrap(),
+            Duration::minutes(15)
+        );
+        assert_eq!(parse_relative_duration("2h").unwrap(), Duration::hours(2));
+        assert_eq!(parse_relative_duration("1d").unwrap(), Duration::days(1));
+        // Bare integer = seconds.
+        assert_eq!(
+            parse_relative_duration("45").unwrap(),
+            Duration::seconds(45)
+        );
+        // Junk / non-positive rejected.
+        assert!(parse_relative_duration("soon").is_err());
+        assert!(parse_relative_duration("0m").is_err());
+        assert!(parse_relative_duration("-5m").is_err());
+    }
+
+    #[test]
+    fn next_fire_one_shot_fires_once_and_catches_up() {
+        let now = Utc::now();
+        // A run_at already in the past is still "due" — next_fire
+        // returns it so the tick loop (next <= now) fires immediately
+        // rather than losing the slot (the catch-up property).
+        let past = (now - chrono::Duration::hours(1)).to_rfc3339();
+        let pending = Schedule {
+            run_at: Some(past.clone()),
+            ..Default::default()
+        };
+        let next = next_fire(&pending, now).expect("pending one-shot is due");
+        assert!(next <= now, "past run_at should be due now");
+
+        // Once it has fired (last_run set), it never fires again.
+        let fired = Schedule {
+            run_at: Some(past),
+            last_run: Some(now.to_rfc3339()),
+            ..Default::default()
+        };
+        assert!(next_fire(&fired, now).is_none());
+    }
+
+    #[test]
+    fn next_fire_recurring_delegates_to_cron() {
+        let now = Utc::now();
+        let recurring = Schedule {
+            cron: "* * * * *".into(),
+            ..Default::default()
+        };
+        // Delegates to compute_next_fire — a once-a-minute cron always
+        // has a next fire after `now`.
+        assert!(next_fire(&recurring, now).is_some());
+    }
+
+    #[test]
+    fn one_shot_serde_omits_field_when_absent_and_old_files_parse() {
+        // A recurring schedule serializes without a runAt key.
+        let recurring = Schedule {
+            id: "r".into(),
+            cron: "* * * * *".into(),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&recurring).unwrap();
+        assert!(!json.contains("runAt"), "absent run_at must be skipped");
+
+        // An old schedules.json with no runAt field still deserializes.
+        let legacy = r#"{"id":"r","cron":"* * * * *","cwd":"/tmp","prompt":"hi","enabled":true}"#;
+        let back: Schedule = serde_json::from_str(legacy).unwrap();
+        assert!(back.run_at.is_none());
+
+        // A one-shot round-trips with a camelCase runAt key.
+        let one_shot = Schedule {
+            id: "o".into(),
+            run_at: Some("2026-05-24T15:30:00Z".into()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&one_shot).unwrap();
+        assert!(json.contains("\"runAt\":\"2026-05-24T15:30:00Z\""));
+    }
+
     #[test]
     fn schedule_store_roundtrip() {
         let mut store = ScheduleStore::default();
@@ -1404,12 +1716,14 @@ mod tests {
                 cwd: std::env::temp_dir(),
                 prompt: "hello".into(),
                 model: Some("gpt-4o".into()),
+                resume_session: None,
                 max_iterations: Some(20),
                 timeout_secs: Some(60),
                 enabled: true,
                 watch_workspace: false,
                 last_run: None,
                 last_exit: None,
+                run_at: None,
             })
             .unwrap();
         let json = serde_json::to_string(&store).unwrap();
@@ -1428,12 +1742,14 @@ mod tests {
             cwd: std::env::temp_dir(),
             prompt: "x".into(),
             model: None,
+            resume_session: None,
             max_iterations: None,
             timeout_secs: None,
             enabled: true,
             watch_workspace: false,
             last_run: None,
             last_exit: None,
+            run_at: None,
         };
         store.add(mk("dup")).unwrap();
         assert!(store.add(mk("dup")).is_err());
@@ -1448,12 +1764,14 @@ mod tests {
             cwd: std::env::temp_dir(),
             prompt: "x".into(),
             model: None,
+            resume_session: None,
             max_iterations: None,
             timeout_secs: None,
             enabled: true,
             watch_workspace: false,
             last_run: None,
             last_exit: None,
+            run_at: None,
         };
         assert!(store.add(bad).is_err());
         assert_eq!(store.schedules.len(), 0);
@@ -1469,12 +1787,14 @@ mod tests {
                 cwd: std::env::temp_dir(),
                 prompt: "p".into(),
                 model: None,
+                resume_session: None,
                 max_iterations: None,
                 timeout_secs: None,
                 enabled: true,
                 watch_workspace: false,
                 last_run: None,
                 last_exit: None,
+                run_at: None,
             })
             .unwrap();
         assert!(store.remove("x"));
@@ -1490,6 +1810,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn spawn_job_captures_exit_and_writes_log() {
+        // `log_dir_for` reads `$HOME` to place the log file. Concurrent
+        // tests in tools/{memory,kms} + research/* + kms.rs flip HOME
+        // to tempdirs they then drop on guard release — racing those
+        // would leave `outcome.log_path` pointing at a deleted dir.
+        let _env = crate::kms::test_env_lock();
         let tmp = tempfile::tempdir().unwrap();
         // Fake binary: ignores --print + the prompt, just echoes its
         // cwd to stdout and exits 0. This proves cwd was honored.
@@ -1504,26 +1829,37 @@ mod tests {
             cwd: work.path().to_path_buf(),
             prompt: "hello there".into(),
             model: None,
+            resume_session: None,
             max_iterations: None,
             timeout_secs: Some(5),
             enabled: true,
             watch_workspace: false,
             last_run: None,
             last_exit: None,
+            run_at: None,
         };
         let outcome = spawn_job(&schedule, &fake).unwrap();
         assert_eq!(outcome.exit_code, Some(7));
         assert!(!outcome.timed_out);
-        let log = std::fs::read_to_string(&outcome.log_path).unwrap();
+        // The fake echoes pwd + the prompt to STDOUT, which is now the
+        // auto-saved RESULT file in the workspace (.thclaws/schedule/...).
+        let result = std::fs::read_to_string(&outcome.result_path).unwrap();
+        assert!(
+            outcome
+                .result_path
+                .starts_with(work.path().join(".thclaws").join("state").join("schedule")),
+            "result must be saved in the workspace; got: {}",
+            outcome.result_path.display()
+        );
         // pwd in the spawned shell should match `work.path()` after
         // canonicalization (macOS adds `/private` to `/var/folders/...`).
         let canonical = work.path().canonicalize().unwrap();
         assert!(
-            log.contains(canonical.to_string_lossy().trim_end_matches('/'))
-                || log.contains(work.path().to_string_lossy().trim_end_matches('/')),
-            "log should contain cwd; got: {log}"
+            result.contains(canonical.to_string_lossy().trim_end_matches('/'))
+                || result.contains(work.path().to_string_lossy().trim_end_matches('/')),
+            "result should contain cwd; got: {result}"
         );
-        assert!(log.contains("prompt-was: hello there"));
+        assert!(result.contains("prompt-was: hello there"));
 
         // Cleanup the schedule's log directory we just created under
         // the real ~/.local/share/thclaws/logs/<id>/.
@@ -1695,7 +2031,7 @@ mod tests {
         // Pre-create the .thclaws directory so the file write below
         // is observed as a child of an existing dir (some platforms
         // emit different events for create-dir vs create-in-dir).
-        let thclaws_dir = work.path().join(".thclaws").join("sessions");
+        let thclaws_dir = work.path().join(".thclaws").join("state").join("sessions");
         std::fs::create_dir_all(&thclaws_dir).unwrap();
 
         let store_dir = tempfile::tempdir().unwrap();
@@ -1827,18 +2163,13 @@ mod tests {
             .with_timezone(&Utc);
         let fires = compute_next_n_fires("0 9 * * *", after, 3);
         assert_eq!(fires.len(), 3);
-        assert_eq!(
-            fires[0].format("%Y-%m-%dT%H:%M").to_string(),
-            "2026-05-06T09:00"
-        );
-        assert_eq!(
-            fires[1].format("%Y-%m-%dT%H:%M").to_string(),
-            "2026-05-07T09:00"
-        );
-        assert_eq!(
-            fires[2].format("%Y-%m-%dT%H:%M").to_string(),
-            "2026-05-08T09:00"
-        );
+        assert!(fires.windows(2).all(|pair| pair[0] < pair[1]));
+        for fire in fires {
+            assert_eq!(
+                fire.with_timezone(&Local).format("%H:%M").to_string(),
+                "09:00"
+            );
+        }
     }
 
     #[test]
@@ -1855,13 +2186,15 @@ mod tests {
 
     #[test]
     fn compute_next_fire_handles_minute_cron() {
-        // 8:30 every day. After 2026-05-06T08:00:00Z next fire is 08:30 same day.
+        // 8:30 every day in local time.
         let after = DateTime::parse_from_rfc3339("2026-05-06T08:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
         let next = compute_next_fire("30 8 * * *", after).unwrap();
-        assert_eq!(next.format("%H:%M").to_string(), "08:30");
-        assert_eq!(next.format("%Y-%m-%d").to_string(), "2026-05-06");
+        assert_eq!(
+            next.with_timezone(&Local).format("%H:%M").to_string(),
+            "08:30"
+        );
     }
 
     #[test]
@@ -1878,12 +2211,14 @@ mod tests {
             cwd: std::env::temp_dir(),
             prompt: "p".into(),
             model: None,
+            resume_session: None,
             max_iterations: None,
             timeout_secs: None,
             enabled: true,
             watch_workspace: false,
             last_run: None,
             last_exit: None,
+            run_at: None,
         };
         assert!(parse_last_run(&s).is_none());
     }
@@ -1896,18 +2231,36 @@ mod tests {
             cwd: std::env::temp_dir(),
             prompt: "p".into(),
             model: None,
+            resume_session: None,
             max_iterations: None,
             timeout_secs: None,
             enabled: true,
             watch_workspace: false,
             last_run: Some("2026-05-06T12:34:56Z".into()),
             last_exit: None,
+            run_at: None,
         };
         let parsed = parse_last_run(&s).unwrap();
         assert_eq!(
             parsed.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
             "2026-05-06T12:34:56Z"
         );
+    }
+
+    #[test]
+    fn display_last_run_formats_local_time_and_preserves_instant() {
+        let displayed = display_last_run(Some("2026-05-06T12:34:56Z"));
+        let parsed = DateTime::parse_from_rfc3339(&displayed).unwrap();
+        assert_eq!(
+            parsed.with_timezone(&Utc).to_rfc3339(),
+            "2026-05-06T12:34:56+00:00"
+        );
+    }
+
+    #[test]
+    fn display_last_run_handles_absent_and_invalid_values() {
+        assert_eq!(display_last_run(None), "never");
+        assert_eq!(display_last_run(Some("bad-timestamp")), "bad-timestamp");
     }
 
     /// Tick logic end-to-end: covers catch-up skipping (fresh
@@ -1940,12 +2293,14 @@ mod tests {
                 cwd: work.path().to_path_buf(),
                 prompt: "p".into(),
                 model: None,
+                resume_session: None,
                 max_iterations: None,
                 timeout_secs: Some(5),
                 enabled: true,
                 watch_workspace: false,
                 last_run: Some(two_min_ago.clone()),
                 last_exit: None,
+                run_at: None,
             })
             .unwrap();
         store
@@ -1955,12 +2310,14 @@ mod tests {
                 cwd: work.path().to_path_buf(),
                 prompt: "p".into(),
                 model: None,
+                resume_session: None,
                 max_iterations: None,
                 timeout_secs: Some(5),
                 enabled: true,
                 watch_workspace: false,
                 last_run: None,
                 last_exit: None,
+                run_at: None,
             })
             .unwrap();
         store
@@ -1970,12 +2327,14 @@ mod tests {
                 cwd: work.path().to_path_buf(),
                 prompt: "p".into(),
                 model: None,
+                resume_session: None,
                 max_iterations: None,
                 timeout_secs: Some(5),
                 enabled: false,
                 watch_workspace: false,
                 last_run: Some(two_min_ago.clone()),
                 last_exit: None,
+                run_at: None,
             })
             .unwrap();
         store.save_to(&store_path).unwrap();
@@ -2107,12 +2466,14 @@ mod tests {
             cwd: work.path().to_path_buf(),
             prompt: "p".into(),
             model: None,
+            resume_session: None,
             max_iterations: None,
             timeout_secs: Some(1),
             enabled: true,
             watch_workspace: false,
             last_run: None,
             last_exit: None,
+            run_at: None,
         };
         let outcome = spawn_job(&schedule, &fake).unwrap();
         assert!(outcome.timed_out);

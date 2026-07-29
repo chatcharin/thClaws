@@ -15,6 +15,11 @@ type KeyStatus = {
   env_set: boolean;
   key_length: number;
   kind?: "provider" | "service";
+  // Featured-tier (gateway-routable) provider — drives the modal's
+  // "Featured" vs "Additional" grouping. Representative default model shown
+  // as a hint, mirroring `/providers`.
+  featured?: boolean;
+  default_model?: string;
 };
 
 type EndpointStatus = {
@@ -39,7 +44,6 @@ function isSentinel(s: string): boolean {
 }
 
 const PROVIDER_LABELS: Record<string, string> = {
-  "agentic-press": "Agentic Press LLM",
   anthropic: "Anthropic",
   openai: "OpenAI",
   openrouter: "OpenRouter",
@@ -49,10 +53,15 @@ const PROVIDER_LABELS: Record<string, string> = {
   "ollama-anthropic": "Ollama (Anthropic-compatible)",
   "ollama-cloud": "Ollama Cloud",
   "opencode-go": "OpenCode Go",
+  moonshot: "Moonshot AI (Kimi)",
+  xai: "xAI (Grok)",
+  groq: "Groq",
+  minimax: "MiniMax",
   azure: "Azure AI Foundry",
   "openai-compat": "OpenAI-Compatible (custom endpoint)",
   tavily: "Tavily Search",
   "brave-search": "Brave Search",
+  serpapi: "SerpAPI (Google Search)",
   hal: "HAL Public API (YouTube transcript + Web scrape)",
 };
 
@@ -66,7 +75,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   // Storage backend: null until we hear back from the backend. If the
   // backend reports `null` (user never picked), we show the chooser
   // dialog first and only render the key fields after the user picks.
-  const [backend, setBackend] = useState<"keychain" | "dotenv" | null>(null);
+  const [backend, setBackend] = useState<"keychain" | "dotenv" | "hosted" | null>(null);
   const [backendKnown, setBackendKnown] = useState(false);
 
   // Ask the backend for the stored preference first. Nothing else
@@ -75,7 +84,15 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
     const unsub = subscribe((msg) => {
       if (msg.type === "secrets_backend") {
         const value = (msg.backend as string | null) ?? null;
-        setBackend(value === "keychain" || value === "dotenv" ? value : null);
+        // "hosted" is the engine's signal that this is a cloud
+        // workspace (gateway OR BYOK) — no local key storage applies.
+        // Treat it as "no chooser needed" rather than null (which
+        // would re-prompt the picker pointlessly).
+        const recognized =
+          value === "keychain" || value === "dotenv" || value === "hosted"
+            ? value
+            : null;
+        setBackend(recognized);
         setBackendKnown(true);
       }
     });
@@ -177,6 +194,11 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   const llmEntries = Array.from(providers.entries()).filter(
     ([, row]) => (row.key?.kind ?? "provider") !== "service",
   );
+  // Group LLM providers like `/providers`: Featured (gateway-routable) first,
+  // then Additional (BYOK). Backend already returns them in display order, so
+  // each filter preserves it. Endpoint-only providers (no key row) are BYOK.
+  const featuredEntries = llmEntries.filter(([, row]) => row.key?.featured === true);
+  const additionalEntries = llmEntries.filter(([, row]) => row.key?.featured !== true);
   const serviceEntries = Array.from(providers.entries()).filter(
     ([, row]) => row.key?.kind === "service",
   );
@@ -282,9 +304,47 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
         </p>
 
         <div className="flex flex-col gap-3">
-          <GatewaySettingsSection />
+          <CloudSection />
+          <AgentIdentitySection />
+          <AutoLearnSection />
 
-          {llmEntries.map(([provider, row]) =>
+          {featuredEntries.length > 0 && (
+            <div className="flex items-center justify-between mt-2 gap-3">
+              <div
+                className="text-[10px] uppercase tracking-wider"
+                style={{ color: "var(--text-secondary)" }}
+              >
+                Featured (gateway-routable)
+              </div>
+              <GatewayProxyToggle />
+            </div>
+          )}
+          {featuredEntries.map(([provider, row]) =>
+            renderProviderCard(
+              provider,
+              row,
+              keyDrafts,
+              setKeyDrafts,
+              urlDrafts,
+              setUrlDrafts,
+              handleSaveKey,
+              handleClearKey,
+              handleSaveUrl,
+              handleClearUrl,
+              busy,
+              flash,
+            ),
+          )}
+
+          {additionalEntries.length > 0 && (
+            <div
+              className="text-[10px] uppercase tracking-wider mt-2"
+              style={{ color: "var(--text-secondary)" }}
+            >
+              Additional (bring your own key)
+            </div>
+          )}
+          {additionalEntries.map(([provider, row]) =>
             renderProviderCard(
               provider,
               row,
@@ -355,8 +415,19 @@ function renderProviderCard(
       style={{ background: "var(--bg-tertiary)", border: "1px solid var(--border)" }}
     >
       <div className="flex items-center justify-between mb-2">
-        <div className="text-xs font-semibold" style={{ color: "var(--text-primary)" }}>
-          {label}
+        <div className="flex items-baseline gap-2">
+          <div className="text-xs font-semibold" style={{ color: "var(--text-primary)" }}>
+            {label}
+          </div>
+          {row.key?.default_model && (
+            <span
+              className="text-[10px] font-mono truncate"
+              style={{ color: "var(--text-secondary)", opacity: 0.7 }}
+              title={`Default model: ${row.key.default_model}`}
+            >
+              → {row.key.default_model}
+            </span>
+          )}
         </div>
       </div>
 
@@ -391,14 +462,9 @@ function renderProviderCard(
       )}
 
       {provider === "openrouter" && <OpenRouterFreeOnlyToggle />}
-      {GATEWAY_PROVIDERS.has(provider) && <GatewayPerProviderToggle provider={provider} />}
     </div>
   );
 }
-
-/// Provider names that have an upstream route on the thClaws Gateway.
-/// Must match `crate::providers::thclaws_gateway::provider_segment`.
-const GATEWAY_PROVIDERS = new Set(["openai", "anthropic", "gemini", "openrouter"]);
 
 /// OpenRouter-only inline toggle. When on, both the model picker
 /// and the `/models` slash command hide non-free rows. Persisted
@@ -428,18 +494,14 @@ function OpenRouterFreeOnlyToggle() {
   );
 }
 
-/// Frontend provider id → gateway path segment. Must mirror
-/// `crate::providers::thclaws_gateway::provider_segment`.
-const PROVIDER_TO_GATEWAY_SEGMENT: Record<string, string> = {
-  openai: "openai",
-  anthropic: "anthropic",
-  gemini: "google",
-  openrouter: "openrouter",
-};
 
 type GatewaySettings = {
   base_url: string;
-  use_for: string[];
+  // Single proxy flag (was a per-provider list). When on + a CLI token exists,
+  // every gateway-routable provider routes through the thClaws Gateway.
+  proxy: boolean;
+  // Whether a CLI access token is present — the toggle is enabled only then.
+  has_cli_token: boolean;
 };
 
 let cachedGatewaySettings: GatewaySettings | null = null;
@@ -455,11 +517,11 @@ function ensureGatewaySubscription() {
   (ensureGatewaySubscription as { inited?: boolean }).inited = true;
   subscribe((msg) => {
     if (msg.type === "gateway_settings" || msg.type === "gateway_settings_result") {
-      const settings = {
+      applyGatewaySettings({
         base_url: String((msg as { base_url?: string }).base_url ?? ""),
-        use_for: ((msg as { use_for?: string[] }).use_for ?? []).map((s) => String(s)),
-      };
-      applyGatewaySettings(settings);
+        proxy: Boolean((msg as { proxy?: boolean }).proxy),
+        has_cli_token: Boolean((msg as { has_cli_token?: boolean }).has_cli_token),
+      });
     }
   });
   send({ type: "gateway_settings_get" });
@@ -467,7 +529,7 @@ function ensureGatewaySubscription() {
 
 function useGatewaySettings(): GatewaySettings {
   const [state, setState] = useState<GatewaySettings>(
-    () => cachedGatewaySettings ?? { base_url: "", use_for: [] },
+    () => cachedGatewaySettings ?? { base_url: "", proxy: false, has_cli_token: false },
   );
   useEffect(() => {
     ensureGatewaySubscription();
@@ -480,109 +542,43 @@ function useGatewaySettings(): GatewaySettings {
   return state;
 }
 
-function persistGatewaySettings(use_for: string[]) {
-  // Base URL is fixed on the backend; the IPC echoes it back in
-  // gateway_settings_result so we always render the current value.
-  const current = cachedGatewaySettings?.base_url ?? "";
-  applyGatewaySettings({ base_url: current, use_for });
-  send({ type: "gateway_settings_set", use_for });
+function persistGatewaySettings(proxy: boolean) {
+  applyGatewaySettings({
+    base_url: cachedGatewaySettings?.base_url ?? "",
+    proxy,
+    has_cli_token: cachedGatewaySettings?.has_cli_token ?? false,
+  });
+  send({ type: "gateway_settings_set", proxy });
 }
 
-/// Top-of-modal card: access key field for the fixed thClaws Gateway.
-/// Access key persists to the keychain via the existing api_key_set
-/// IPC (provider name "gateway"). The gateway base URL is hard-coded
-/// on the backend (see `providers::thclaws_gateway::GATEWAY_BASE_URL`)
-/// — users only paste their key and flip the per-provider toggles.
-function GatewaySettingsSection() {
+/// Single global "Use thClaws Gateway proxy" switch. Enabled only when a CLI
+/// access token is present (no token, no proxy). When on, every gateway-routable
+/// provider routes through the gateway for featured (priced) models; everything
+/// else stays BYOK. Replaces the old per-provider checkboxes.
+function GatewayProxyToggle() {
   const settings = useGatewaySettings();
-  const [keyDraft, setKeyDraft] = useState("");
-  const onSaveKey = () => {
-    const trimmed = keyDraft.trim();
-    if (!trimmed) return;
-    send({ type: "api_key_set", provider: "gateway", key: trimmed });
-    setKeyDraft("");
-  };
-  return (
-    <div
-      className="rounded-lg p-3"
-      style={{ background: "var(--bg-tertiary)", border: "1px solid var(--border)" }}
-    >
-      <div className="flex items-center gap-2 mb-1">
-        <LinkIcon size={12} style={{ color: "var(--accent)" }} />
-        <span className="text-sm font-semibold" style={{ color: "var(--text-primary)" }}>
-          thClaws Gateway
-        </span>
-      </div>
-      <p className="text-xs mb-2" style={{ color: "var(--text-secondary)" }}>
-        Route per-provider traffic through <span className="font-mono">{settings.base_url}</span>.
-        Paste your access key here, then flip "Use thClaws Gateway" on the provider cards below.
-      </p>
-      <FieldLabel icon={<KeyRound size={11} />} text="Access key" env="THCLAWS_GATEWAY_API_KEY" />
-      <div className="flex gap-1.5">
-        <input
-          type="password"
-          placeholder="Paste gateway access key (gw_v1_…)"
-          className="flex-1 px-2.5 py-1.5 rounded text-xs font-mono outline-none"
-          style={{
-            background: "var(--bg-primary)",
-            color: "var(--text-primary)",
-            border: "1px solid var(--border)",
-          }}
-          value={keyDraft}
-          onChange={(e) => setKeyDraft(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") onSaveKey();
-          }}
-          autoComplete="off"
-        />
-        <button
-          type="button"
-          onClick={onSaveKey}
-          disabled={!keyDraft.trim()}
-          className="px-2 py-1.5 rounded text-xs"
-          style={{
-            background: keyDraft.trim() ? "var(--accent)" : "var(--bg-primary)",
-            color: keyDraft.trim() ? "var(--accent-fg)" : "var(--text-secondary)",
-            border: "1px solid var(--border)",
-            cursor: keyDraft.trim() ? "pointer" : "not-allowed",
-          }}
-        >
-          Save
-        </button>
-      </div>
-    </div>
-  );
-}
-
-/// Per-provider "Use thClaws Gateway" checkbox in the provider card.
-/// Always enabled — gateway routing kicks in once the user has also
-/// pasted the access key (overlay returns None and falls back to the
-/// upstream when the key is missing, so toggling without a key is a
-/// no-op rather than an error).
-function GatewayPerProviderToggle({ provider }: { provider: string }) {
-  const settings = useGatewaySettings();
-  const segment = PROVIDER_TO_GATEWAY_SEGMENT[provider];
-  const on = !!segment && settings.use_for.includes(segment);
-  const onChange = (checked: boolean) => {
-    if (!segment) return;
-    const next = new Set(settings.use_for);
-    if (checked) next.add(segment);
-    else next.delete(segment);
-    persistGatewaySettings(Array.from(next));
-  };
+  const disabled = !settings.has_cli_token;
   return (
     <label
-      className="flex items-center gap-2 mt-2 text-xs select-none cursor-pointer"
-      style={{ color: "var(--text-secondary)" }}
-      title={`Route ${provider} traffic through the thClaws Gateway.`}
+      className="flex items-center gap-2 text-xs select-none"
+      style={{
+        color: "var(--text-secondary)",
+        cursor: disabled ? "not-allowed" : "pointer",
+        opacity: disabled ? 0.5 : 1,
+      }}
+      title={
+        disabled
+          ? "Sign in to thClaws Cloud (CLI token) to use the gateway proxy."
+          : "Route featured models through the thClaws Gateway (billed to your cloud account). Other models stay BYOK."
+      }
     >
       <input
         type="checkbox"
-        checked={on}
-        disabled={!segment}
-        onChange={(e) => onChange(e.target.checked)}
+        checked={settings.proxy && !disabled}
+        disabled={disabled}
+        onChange={(e) => persistGatewaySettings(e.target.checked)}
       />
-      <span>Use thClaws Gateway</span>
+      <span>Use Gateway Proxy{disabled ? " (needs CLI token)" : ""}</span>
     </label>
   );
 }
@@ -779,6 +775,598 @@ function FlashLine({ flash }: { flash?: { ok: boolean; msg: string } }) {
       style={{ color: flash.ok ? "var(--accent)" : "var(--danger, #e06c75)" }}
     >
       {flash.msg}
+    </div>
+  );
+}
+
+// ── thClaws.cloud (dev-plan/34) ──────────────────────────────────────
+// URL persists to settings.json::cloud.url; CLI token persists to the
+// active secrets backend (keychain or ~/.config/thclaws/.env). The engine
+// ipc handler pair is cloud_config_get / cloud_config_set.
+interface CloudConfig {
+  url: string | null;
+  default_url: string;
+  has_token: boolean;
+  token_length: number;
+  env_var_set: boolean;
+  token_writable: boolean;
+}
+
+// dev-plan/51 P3b: runs a `/cloud push|pull` slash command in the shared
+// session (output streams to Chat) — pure convenience over typing the slash.
+function SyncButton({ label, cmd, enabled }: { label: string; cmd: string; enabled: boolean }) {
+  return (
+    <button
+      onClick={() => send({ type: "shell_input", text: cmd })}
+      disabled={!enabled}
+      className="px-2.5 py-1.5 rounded text-xs font-medium whitespace-nowrap"
+      style={{
+        background: enabled ? "var(--accent)" : "var(--bg-primary)",
+        color: enabled ? "#fff" : "var(--text-secondary)",
+        border: "1px solid var(--border)",
+        cursor: enabled ? "pointer" : "default",
+        opacity: enabled ? 1 : 0.6,
+      }}
+      title={enabled ? `Run ${cmd} (watch output in Chat)` : "Save a thClaws.cloud CLI token above first"}
+    >
+      {label}
+    </button>
+  );
+}
+
+function CloudSection() {
+  const [cfg, setCfg] = useState<CloudConfig>({
+    url: null,
+    default_url: "https://thclaws.cloud",
+    has_token: false,
+    token_length: 0,
+    env_var_set: false,
+    token_writable: true,
+  });
+  const [urlDraft, setUrlDraft] = useState("");
+  const [tokenDraft, setTokenDraft] = useState("");
+  const [flash, setFlash] = useState<{ ok: boolean; msg: string } | undefined>(undefined);
+  // dev-plan/44: phone-home pairing status (the ack from the IPC layer;
+  // the actual pair → connect runs on the worker and streams to chat).
+  const [phoneHome, setPhoneHome] = useState<{ pending: boolean; msg?: string }>({
+    pending: false,
+  });
+
+  useEffect(() => {
+    const unsub = subscribe((msg) => {
+      if (msg.type === "cloud_config") {
+        const next = msg as unknown as CloudConfig & { type: string };
+        setCfg({
+          url: next.url ?? null,
+          default_url: next.default_url ?? "https://thclaws.cloud",
+          has_token: !!next.has_token,
+          token_length: typeof next.token_length === "number" ? next.token_length : 0,
+          env_var_set: !!next.env_var_set,
+          token_writable: !!next.token_writable,
+        });
+      } else if (msg.type === "phone_home_pair_ack") {
+        const r = msg as { ok?: boolean; error?: string; pending?: boolean };
+        if (r.ok && r.pending) setPhoneHome({ pending: true, msg: "pairing… (see chat)" });
+        else if (!r.ok) setPhoneHome({ pending: false, msg: r.error ?? "pairing failed" });
+      } else if (msg.type === "cloud_config_result") {
+        const r = msg as {
+          url_ok?: boolean;
+          url_error?: string;
+          token_ok?: boolean;
+          token_error?: string;
+        };
+        if (r.url_ok === false || r.token_ok === false) {
+          const parts: string[] = [];
+          if (r.url_ok === false) parts.push(`URL: ${r.url_error ?? "failed"}`);
+          if (r.token_ok === false) parts.push(`Token: ${r.token_error ?? "failed"}`);
+          setFlash({ ok: false, msg: parts.join(" · ") });
+        } else {
+          setFlash({ ok: true, msg: "saved" });
+          setUrlDraft("");
+          setTokenDraft("");
+          setTimeout(() => setFlash(undefined), 2500);
+        }
+        send({ type: "cloud_config_get" });
+      }
+    });
+    send({ type: "cloud_config_get" });
+    return unsub;
+  }, []);
+
+  const onSaveUrl = () => {
+    const trimmed = urlDraft.trim();
+    if (!trimmed) return;
+    send({ type: "cloud_config_set", url: trimmed });
+  };
+  const onClearUrl = () => {
+    send({ type: "cloud_config_set", url: "" });
+    setUrlDraft("");
+  };
+  const onSaveToken = () => {
+    const trimmed = tokenDraft.trim();
+    if (!trimmed || isSentinel(trimmed)) return;
+    send({ type: "cloud_config_set", token: trimmed });
+  };
+  const onClearToken = () => {
+    send({ type: "cloud_config_set", token: "" });
+    setTokenDraft("");
+  };
+  const onPhoneHome = () => {
+    setPhoneHome({ pending: true, msg: "pairing…" });
+    send({ type: "phone_home_pair" });
+  };
+
+  const urlValue = urlDraft || cfg.url || "";
+  const urlDirty = urlValue.trim() !== (cfg.url ?? "").trim() && urlValue.trim().length > 0;
+
+  const tokenSentinel = cfg.has_token
+    ? cfg.token_length > 0
+      ? sentinelFor(cfg.token_length)
+      : FALLBACK_SENTINEL
+    : "";
+  const tokenValue = tokenDraft || tokenSentinel;
+  const tokenDirty = tokenDraft.trim().length > 0 && !isSentinel(tokenDraft.trim());
+
+  return (
+    <div
+      className="rounded-lg p-3"
+      style={{ background: "var(--bg-tertiary)", border: "1px solid var(--border)" }}
+    >
+      <div className="flex items-center gap-2 mb-1">
+        <LinkIcon size={12} style={{ color: "var(--accent)" }} />
+        <span className="text-sm font-semibold" style={{ color: "var(--text-primary)" }}>
+          thClaws.cloud
+        </span>
+      </div>
+      <p className="text-xs mb-2" style={{ color: "var(--text-secondary)" }}>
+        Catalog of folder-shaped AI agents. Mint a CLI token from the
+        dashboard at
+        <span className="font-mono"> {(cfg.url ?? cfg.default_url) + "/dashboard"}</span>{" "}
+        and paste it below — every cloud action
+        (<span className="font-mono">/cloud get</span>,{" "}
+        <span className="font-mono">/cloud publish</span>,{" "}
+        <span className="font-mono">/cloud list</span>) uses it via the
+        Authorization header, no shell-env round-trip.
+      </p>
+
+      <FieldLabel
+        icon={<LinkIcon size={11} />}
+        text="Catalog URL"
+        env="cloud.url in settings.json"
+      />
+      <div className="flex gap-1.5 mb-2">
+        <input
+          type="text"
+          placeholder={cfg.default_url}
+          className="flex-1 px-2.5 py-1.5 rounded text-xs font-mono outline-none"
+          style={{
+            background: "var(--bg-primary)",
+            color: "var(--text-primary)",
+            border: "1px solid var(--border)",
+          }}
+          value={urlValue}
+          onChange={(e) => setUrlDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") onSaveUrl();
+          }}
+          autoComplete="off"
+        />
+        <SaveButton onClick={onSaveUrl} disabled={!urlDirty} />
+        <ClearButton onClick={onClearUrl} disabled={!cfg.url} title="Clear configured URL" />
+      </div>
+
+      <FieldLabel
+        icon={<KeyRound size={11} />}
+        text="CLI token"
+        env="THCLAWS_CLOUD_TOKEN"
+      />
+      <div className="flex gap-1.5">
+        <input
+          type={isSentinel(tokenValue) ? "text" : "password"}
+          placeholder="Paste token from /dashboard (starts with thc_)"
+          className="flex-1 px-2.5 py-1.5 rounded text-xs font-mono outline-none"
+          style={{
+            background: "var(--bg-primary)",
+            color: "var(--text-primary)",
+            border: "1px solid var(--border)",
+          }}
+          value={tokenValue}
+          onChange={(e) => setTokenDraft(e.target.value)}
+          onFocus={(e) => {
+            if (isSentinel(e.currentTarget.value)) e.currentTarget.select();
+          }}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") onSaveToken();
+          }}
+          autoComplete="off"
+          spellCheck={false}
+        />
+        <SaveButton onClick={onSaveToken} disabled={!tokenDirty} />
+        <ClearButton
+          onClick={onClearToken}
+          disabled={!cfg.has_token}
+          title="Clear stored token"
+        />
+      </div>
+      <FlashLine flash={flash} />
+
+      {/* dev-plan/44: phone home — let thClaws.cloud reach this machine's
+          agent over an outbound tunnel (no public IP / inbound port). */}
+      <div className="mt-3 pt-3" style={{ borderTop: "1px solid var(--border)" }}>
+        <div className="flex items-center justify-between gap-3">
+          <div className="min-w-0">
+            <div className="text-xs font-semibold" style={{ color: "var(--text-primary)" }}>
+              📡 thClaws Remote
+            </div>
+            <div className="text-xs" style={{ color: "var(--text-secondary)" }}>
+              Let thClaws.cloud reach this machine&apos;s agent — outbound tunnel, no public
+              IP or open port.
+            </div>
+          </div>
+          <button
+            onClick={onPhoneHome}
+            disabled={!cfg.has_token || phoneHome.pending}
+            className="px-2.5 py-1.5 rounded text-xs font-medium whitespace-nowrap"
+            style={{
+              background: cfg.has_token ? "var(--accent)" : "var(--bg-primary)",
+              color: cfg.has_token ? "#fff" : "var(--text-secondary)",
+              border: "1px solid var(--border)",
+              cursor: cfg.has_token && !phoneHome.pending ? "pointer" : "default",
+              opacity: cfg.has_token && !phoneHome.pending ? 1 : 0.6,
+            }}
+            title={
+              cfg.has_token
+                ? "Pair this machine with your thClaws.cloud account"
+                : "Save a thClaws.cloud CLI token above first"
+            }
+          >
+            {phoneHome.pending ? "Enabling…" : "Enable"}
+          </button>
+        </div>
+        {phoneHome.msg && (
+          <div className="text-xs mt-1" style={{ color: "var(--text-secondary)" }}>
+            {phoneHome.msg}
+          </div>
+        )}
+      </div>
+
+      {/* dev-plan/51: workspace sync — mirror this folder to/from a hosted
+          cloud workspace. Runs /cloud push|pull in the shared session; output
+          streams to Chat (close Settings to watch). */}
+      <div className="mt-3 pt-3" style={{ borderTop: "1px solid var(--border)" }}>
+        <div className="text-xs font-semibold mb-1" style={{ color: "var(--text-primary)" }}>
+          🔄 Workspace sync
+        </div>
+        <div className="text-xs mb-2" style={{ color: "var(--text-secondary)" }}>
+          Mirror this folder to/from your hosted cloud workspace. Runs in Chat —
+          close Settings to watch the result.
+        </div>
+        <div className="flex gap-1.5">
+          <SyncButton label="⬆ Push to cloud" cmd="/cloud push" enabled={cfg.has_token} />
+          <SyncButton label="⬇ Pull from cloud" cmd="/cloud pull" enabled={cfg.has_token} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Agent identity (dev-plan/34 Option A) ───────────────────────────
+// settings.json::agent — this folder's authoritative agent identity.
+// UUID is read-only (server-managed by `cloud publish`); the other
+// three are editable. Pairs with the thClaws.cloud section above.
+interface AgentConfig {
+  exists: boolean;
+  id: string | null;
+  name: string | null;
+  description: string | null;
+  uuid: string | null;
+}
+
+function AgentIdentitySection() {
+  const [cfg, setCfg] = useState<AgentConfig>({
+    exists: false,
+    id: null,
+    name: null,
+    description: null,
+    uuid: null,
+  });
+  const [idDraft, setIdDraft] = useState("");
+  const [nameDraft, setNameDraft] = useState("");
+  const [descDraft, setDescDraft] = useState("");
+  const [touched, setTouched] = useState({ id: false, name: false, description: false });
+  const [flash, setFlash] = useState<{ ok: boolean; msg: string } | undefined>(undefined);
+
+  useEffect(() => {
+    const unsub = subscribe((msg) => {
+      if (msg.type === "agent_config") {
+        const next = msg as unknown as AgentConfig & { type: string };
+        setCfg(next);
+        setIdDraft("");
+        setNameDraft("");
+        setDescDraft("");
+        setTouched({ id: false, name: false, description: false });
+      } else if (msg.type === "agent_config_result") {
+        const r = msg as { ok?: boolean; error?: string };
+        if (r.ok) {
+          setFlash({ ok: true, msg: "saved" });
+          setTimeout(() => setFlash(undefined), 2500);
+          send({ type: "agent_config_get" });
+        } else {
+          setFlash({ ok: false, msg: r.error ?? "failed" });
+        }
+      } else if (msg.type === "agent_unbind_result") {
+        const r = msg as { ok?: boolean; error?: string; had_uuid?: boolean };
+        if (r.ok) {
+          setFlash({
+            ok: true,
+            msg: r.had_uuid ? "unbound — next publish creates a new entry" : "already unbound",
+          });
+          setTimeout(() => setFlash(undefined), 3500);
+          send({ type: "agent_config_get" });
+        } else {
+          setFlash({ ok: false, msg: r.error ?? "failed" });
+        }
+      }
+    });
+    send({ type: "agent_config_get" });
+    return unsub;
+  }, []);
+
+  const idValue = touched.id ? idDraft : cfg.id ?? "";
+  const nameValue = touched.name ? nameDraft : cfg.name ?? "";
+  const descValue = touched.description ? descDraft : cfg.description ?? "";
+
+  const dirty =
+    (touched.id && idValue.trim() !== (cfg.id ?? "").trim()) ||
+    (touched.name && nameValue.trim() !== (cfg.name ?? "").trim()) ||
+    (touched.description && descValue.trim() !== (cfg.description ?? "").trim());
+
+  const onSave = () => {
+    const payload: { type: "agent_config_set"; id?: string; name?: string; description?: string } = {
+      type: "agent_config_set",
+    };
+    if (touched.id) payload.id = idValue.trim();
+    if (touched.name) payload.name = nameValue.trim();
+    if (touched.description) payload.description = descValue.trim();
+    send(payload);
+  };
+
+  const onUnbind = () => {
+    if (!cfg.uuid) return;
+    send({ type: "agent_unbind" });
+  };
+
+  const onInitialize = () => {
+    setTouched({ id: true, name: true, description: true });
+    setIdDraft("");
+    setNameDraft("");
+    setDescDraft("");
+  };
+
+  return (
+    <div
+      className="rounded-lg p-3"
+      style={{ background: "var(--bg-tertiary)", border: "1px solid var(--border)" }}
+    >
+      <div className="flex items-center gap-2 mb-1">
+        <KeyRound size={12} style={{ color: "var(--accent)" }} />
+        <span className="text-sm font-semibold" style={{ color: "var(--text-primary)" }}>
+          Agent identity
+        </span>
+      </div>
+      <p className="text-xs mb-2" style={{ color: "var(--text-secondary)" }}>
+        This folder's catalog identity, stored in{" "}
+        <span className="font-mono">./.thclaws/settings.json::agent</span>.{" "}
+        <span className="font-mono">cloud publish</span> reads from here; the UUID is set by the
+        server on first publish.
+      </p>
+
+      {!cfg.exists && !touched.id && !touched.name && !touched.description && (
+        <div className="mb-2">
+          <p className="text-xs mb-2" style={{ color: "var(--text-secondary)" }}>
+            No <span className="font-mono">agent</span> block yet — initialize one to publish this
+            folder as an agent.
+          </p>
+          <button
+            type="button"
+            className="px-2.5 py-1.5 rounded text-xs font-medium"
+            style={{
+              background: "var(--bg-primary)",
+              color: "var(--accent)",
+              border: "1px solid var(--accent)",
+            }}
+            onClick={onInitialize}
+          >
+            Initialize agent block
+          </button>
+        </div>
+      )}
+
+      {(cfg.exists || touched.id || touched.name || touched.description) && (
+        <>
+          <FieldLabel
+            icon={<KeyRound size={11} />}
+            text="Slug (id)"
+            env="settings.json::agent.id"
+          />
+          <input
+            type="text"
+            placeholder="my-agent"
+            className="w-full px-2.5 py-1.5 rounded text-xs font-mono outline-none mb-2"
+            style={{
+              background: "var(--bg-primary)",
+              color: "var(--text-primary)",
+              border: "1px solid var(--border)",
+            }}
+            value={idValue}
+            onChange={(e) => {
+              setIdDraft(e.target.value);
+              setTouched((t) => ({ ...t, id: true }));
+            }}
+            autoComplete="off"
+            spellCheck={false}
+          />
+
+          <FieldLabel
+            icon={<KeyRound size={11} />}
+            text="Display name"
+            env="settings.json::agent.name"
+          />
+          <input
+            type="text"
+            placeholder="My Agent"
+            className="w-full px-2.5 py-1.5 rounded text-xs outline-none mb-2"
+            style={{
+              background: "var(--bg-primary)",
+              color: "var(--text-primary)",
+              border: "1px solid var(--border)",
+            }}
+            value={nameValue}
+            onChange={(e) => {
+              setNameDraft(e.target.value);
+              setTouched((t) => ({ ...t, name: true }));
+            }}
+            autoComplete="off"
+          />
+
+          <FieldLabel
+            icon={<KeyRound size={11} />}
+            text="Description"
+            env="settings.json::agent.description"
+          />
+          <textarea
+            placeholder="One-line pitch shown on the catalog card."
+            rows={2}
+            className="w-full px-2.5 py-1.5 rounded text-xs outline-none mb-2 resize-none"
+            style={{
+              background: "var(--bg-primary)",
+              color: "var(--text-primary)",
+              border: "1px solid var(--border)",
+            }}
+            value={descValue}
+            onChange={(e) => {
+              setDescDraft(e.target.value);
+              setTouched((t) => ({ ...t, description: true }));
+            }}
+            autoComplete="off"
+          />
+
+          <div className="flex justify-end mb-2">
+            <SaveButton onClick={onSave} disabled={!dirty} />
+          </div>
+
+          <FieldLabel
+            icon={<LinkIcon size={11} />}
+            text="UUID (read-only — server-assigned)"
+            env="settings.json::agent.uuid"
+          />
+          <div className="flex gap-1.5 items-center">
+            <input
+              type="text"
+              readOnly
+              className="flex-1 px-2.5 py-1.5 rounded text-xs font-mono outline-none"
+              style={{
+                background: "var(--bg-primary)",
+                color: cfg.uuid ? "var(--text-primary)" : "var(--text-secondary)",
+                border: "1px solid var(--border)",
+              }}
+              value={cfg.uuid ?? "(unbound — next publish creates new entry)"}
+            />
+            <button
+              type="button"
+              className="px-2.5 py-1.5 rounded text-xs font-medium disabled:opacity-50"
+              style={{
+                background: "transparent",
+                color: "var(--danger, #e06c75)",
+                border: "1px solid var(--danger, #e06c75)",
+              }}
+              disabled={!cfg.uuid}
+              onClick={onUnbind}
+              title="Clear the UUID so the next publish creates a new catalog entry. Use when forking."
+            >
+              Unbind
+            </button>
+          </div>
+
+          <FlashLine flash={flash} />
+        </>
+      )}
+    </div>
+  );
+}
+
+/// Project-scope toggle for `auto_learn` (dev-plan/27). The setting
+/// drives session-end ingestion into the project's KMS plus the
+/// throttled reconcile pass. Reading via `auto_learn_get` returns
+/// the effective AppConfig value (project overlay wins over user
+/// settings); writing via `auto_learn_set` updates the project's
+/// `.thclaws/settings.json`. The shell reloads its AppConfig
+/// immediately so the next session-end pass sees the new state
+/// without a restart.
+function AutoLearnSection() {
+  const [enabled, setEnabled] = useState<boolean | null>(null);
+  const [flash, setFlash] = useState<{ ok: boolean; msg: string } | undefined>(undefined);
+
+  useEffect(() => {
+    const unsub = subscribe((msg) => {
+      if (msg.type === "auto_learn") {
+        setEnabled(Boolean((msg as { enabled?: boolean }).enabled));
+      } else if (msg.type === "auto_learn_result") {
+        const r = msg as { ok?: boolean; error?: string; enabled?: boolean };
+        if (r.ok === false) {
+          setFlash({ ok: false, msg: r.error ?? "failed" });
+        } else {
+          setEnabled(Boolean(r.enabled));
+          setFlash({ ok: true, msg: r.enabled ? "auto-learn enabled" : "auto-learn disabled" });
+          setTimeout(() => setFlash(undefined), 2500);
+        }
+      }
+    });
+    send({ type: "auto_learn_get" });
+    return unsub;
+  }, []);
+
+  const onToggle = (next: boolean) => {
+    // Optimistic update — the `auto_learn_result` reply will
+    // overwrite this with the canonical value if the save failed.
+    setEnabled(next);
+    send({ type: "auto_learn_set", enabled: next });
+  };
+
+  return (
+    <div
+      className="rounded p-3"
+      style={{ background: "var(--bg-tertiary)", border: "1px solid var(--border)" }}
+    >
+      <div className="flex items-center gap-2 mb-1">
+        <span className="text-xs font-semibold" style={{ color: "var(--text-primary)" }}>
+          Auto-learn
+        </span>
+        <span className="text-[10px]" style={{ color: "var(--text-secondary)" }}>
+          project-scope · saved to .thclaws/settings.json
+        </span>
+      </div>
+      <p className="text-xs mb-2" style={{ color: "var(--text-secondary)" }}>
+        At the end of each session, ingest the conversation into the project's KMS
+        (one page per session) and reconcile the index periodically. The model
+        can search and cite prior sessions on later turns. Token cost applies on
+        ingest + reconcile.
+      </p>
+      <label
+        className="flex items-center gap-2 text-xs select-none cursor-pointer"
+        style={{ color: "var(--text-primary)" }}
+      >
+        <input
+          type="checkbox"
+          checked={enabled === true}
+          disabled={enabled === null}
+          onChange={(e) => onToggle(e.target.checked)}
+        />
+        <span>
+          Enable auto-learn for this project
+        </span>
+      </label>
+      <FlashLine flash={flash} />
     </div>
   );
 }

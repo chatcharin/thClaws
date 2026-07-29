@@ -22,10 +22,12 @@ binary จะรันไม่ได้ (ถ้าไม่แน่ใจว�
 
 ## ความต้องการของระบบ
 
-ตัว thClaws เองมีขนาดเล็กมาก — binary ขนาดราว ๆ 20 MB หลังแตกไฟล์
-และใช้ RAM ราว ๆ 250–400 MB ตอนรัน ซึ่งส่วนใหญ่เป็นของ webview
-ที่ระบบปฏิบัติการให้มาเอง (WKWebView บน macOS, WebView2 บน Windows,
-WebKit2GTK บน Linux)
+ตัว thClaws เองมีขนาดเล็ก — ดาวน์โหลดราว ๆ 17 MB (single-arch
+tarball หลัง gzip) แตกไฟล์เป็น binary ราว ๆ 25 MB สำหรับ
+`thclaws-cli` หรือ 40 MB สำหรับ GUI build (`thclaws`) และใช้ RAM
+ราว ๆ 250–400 MB ตอนรัน ซึ่งส่วนใหญ่เป็นของ webview ที่ระบบปฏิบัติการ
+ให้มาเอง (WKWebView บน macOS, WebView2 บน Windows, WebKit2GTK บน
+Linux)
 
 | | ขั้นต่ำ | ที่แนะนำ |
 |---|---|---|
@@ -33,7 +35,7 @@ WebKit2GTK บน Linux)
 | **CPU** | 64-bit x86_64 หรือ ARM64 ของช่วง 10 ปีมานี้ | multi-core รุ่นใหม่ ๆ |
 | **RAM** | ว่างอยู่ 2 GB | รวมทั้งเครื่อง 8 GB |
 | **Disk** | ~50 MB | SSD |
-| **Network** | จำเป็นถ้าใช้ cloud provider (Anthropic / OpenAI / Gemini / OpenRouter / Z.ai / DashScope / Agentic Press); ถ้าใช้แต่ Ollama หรือ LMStudio ในเครื่อง ก็ไม่ต้องใช้เน็ต | broadband |
+| **Network** | จำเป็นถ้าใช้ cloud provider (Anthropic / OpenAI / Gemini / OpenRouter / Z.ai / DashScope); ถ้าใช้แต่ Ollama หรือ LMStudio ในเครื่อง ก็ไม่ต้องใช้เน็ต | broadband |
 
 ถ้าใช้ thClaws กับ cloud provider อย่างเดียว — โน๊ตบุ๊คซื้อมาในช่วงไม่กี่
 ปีหลัง ๆ รันได้สบาย ๆ ส่วนกรณีรันโมเดลในเครื่องเอง (local) เพดานสเปก

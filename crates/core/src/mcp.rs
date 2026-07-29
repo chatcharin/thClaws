@@ -88,6 +88,14 @@ pub struct McpServerConfig {
     /// see dev-log/112.
     #[serde(default)]
     pub trusted: bool,
+    /// Set ONLY by engine code for servers thClaws itself injects
+    /// (e.g. the `browser` Playwright MCP from `browserEnabled`).
+    /// Skips the first-spawn allowlist prompt — the engine chose the
+    /// command, not a cloned repo's mcp.json. `#[serde(skip)]` is the
+    /// security boundary: deserialization always yields `false`, so a
+    /// malicious mcp.json can't grant itself the bypass.
+    #[serde(skip)]
+    pub engine_managed: bool,
 }
 
 fn default_transport() -> String {
@@ -168,6 +176,13 @@ async fn check_stdio_command_allowed(
     config: &McpServerConfig,
     approver: Option<std::sync::Arc<dyn crate::permissions::ApprovalSink>>,
 ) -> Result<()> {
+    // Engine-injected servers skip the prompt: the command was chosen
+    // by thClaws code, not by a (possibly cloned) mcp.json. The field
+    // is #[serde(skip)] so JSON input can never set it.
+    if config.engine_managed {
+        return Ok(());
+    }
+
     // An explicit environment override lets CI and scripted runs skip
     // the prompt once they have already vetted the MCP config.
     if std::env::var("THCLAWS_MCP_ALLOW_ALL").ok().as_deref() == Some("1") {
@@ -314,6 +329,14 @@ pub struct McpClient {
     /// timeout to fire (M6.15 BUG 4). Shared `Arc` so the reader
     /// task can flip the same instance the McpClient reads.
     closed: Arc<std::sync::atomic::AtomicBool>,
+    /// Optional "instructions" string from the MCP `InitializeResult`
+    /// (per spec — servers MAY return this to brief the model on
+    /// when/how to use their tools). Captured in [`Self::initialize`]
+    /// and surfaced into the system prompt's "# MCP server
+    /// instructions" section by `prompts::build_full_system_prompt`.
+    /// `Some("")` is treated as no-op; the renderer trims + skips
+    /// empty strings.
+    instructions: Mutex<Option<String>>,
 }
 
 impl Drop for McpClient {
@@ -397,6 +420,7 @@ impl McpClient {
             _child: Mutex::new(None),
             trusted,
             closed,
+            instructions: Mutex::new(None),
         })
     }
 
@@ -414,6 +438,25 @@ impl McpClient {
         Self::spawn_with_approver(config, None).await
     }
 
+    /// Like [`spawn_with_approver`] but never launches the interactive
+    /// OAuth browser flow for HTTP servers. Used by `/mcp add` (CLI and
+    /// GUI): an HTTP server that requires OAuth returns an error telling
+    /// the user to run `/mcp reauth <name>` instead of freezing the
+    /// command (CLI) or the worker thread (GUI) for up to 5 minutes
+    /// waiting on a browser callback the user may not be ready for
+    /// (issue #114). stdio transport is unaffected — it still goes
+    /// through `spawn_with_approver` with the caller's approver, so the
+    /// command-allowlist gate keeps working in GUI mode.
+    pub async fn spawn_noninteractive(
+        config: McpServerConfig,
+        approver: Option<Arc<dyn crate::permissions::ApprovalSink>>,
+    ) -> Result<Arc<Self>> {
+        if config.transport == "http" {
+            return Self::connect_http(config, false).await;
+        }
+        Self::spawn_with_approver(config, approver).await
+    }
+
     /// Same as [`spawn`] but lets the caller provide an `ApprovalSink`
     /// for the first-time spawn prompt. GUI mode passes its
     /// `GuiApprover` here so MCP approval pops up in the same modal as
@@ -424,7 +467,7 @@ impl McpClient {
         approver: Option<Arc<dyn crate::permissions::ApprovalSink>>,
     ) -> Result<Arc<Self>> {
         if config.transport == "http" {
-            return Self::connect_http(config).await;
+            return Self::connect_http(config, true).await;
         }
 
         // Allowlist gate: MCP stdio configs come from project-scoped
@@ -466,7 +509,7 @@ impl McpClient {
     /// HTTP POST → JSON response. We simulate the stream pair by piping
     /// through an in-memory duplex so the rest of the client (reader task,
     /// pending map) works unchanged.
-    async fn connect_http(config: McpServerConfig) -> Result<Arc<Self>> {
+    async fn connect_http(config: McpServerConfig, interactive_oauth: bool) -> Result<Arc<Self>> {
         if config.url.is_empty() {
             return Err(Error::Provider(format!(
                 "mcp http server '{}': missing 'url' field",
@@ -481,7 +524,15 @@ impl McpClient {
 
         let url = config.url.clone();
         let name_for_task = config.name.clone();
-        let extra_headers = config.headers.clone();
+        // Interpolate `${VAR}` in header values from the environment so a
+        // secret (API key, bearer token) can live in the shell / `.env`
+        // instead of plaintext in mcp.json. Resolved once here; both the
+        // auth probe and every bridge POST use this map.
+        let extra_headers: HashMap<String, String> = config
+            .headers
+            .iter()
+            .map(|(k, v)| (k.clone(), interpolate_env(v)))
+            .collect();
         // Disable auto-redirects: reqwest strips the Authorization header on
         // ALL redirects (even same-origin 307). Our `write_response_lines`
         // handles 307/308 manually, preserving auth + fixing http→https.
@@ -497,12 +548,34 @@ impl McpClient {
         //   2. Try refresh if expired.
         //   3. Probe the server → if 401, run full OAuth browser flow.
         //   4. Only then set up the bridge with the token already loaded.
+        // Probe + discovery get hard timeouts so a stalled server can't
+        // hang `/mcp add` (or a startup spawn) forever. The bridge
+        // `http_client` above deliberately has NO blanket timeout — it
+        // carries streaming SSE responses, and per-request deadlines are
+        // enforced separately by REQUEST_TIMEOUT_SECS in `request()`.
         let http_probe = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(15))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
-        let resolved_token =
-            resolve_token_upfront(&http_probe, &url, &config.name, &config.headers).await;
+        let resolved_token = match resolve_token_upfront(
+            &http_probe,
+            &url,
+            &config.name,
+            &extra_headers,
+            interactive_oauth,
+        )
+        .await
+        {
+            UpfrontToken::Proceed(tok) => tok,
+            UpfrontToken::OAuthRequired => {
+                return Err(Error::Provider(format!(
+                    "MCP server '{}' requires OAuth — run `/mcp reauth {}` to authenticate (opens a browser)",
+                    config.name, config.name
+                )));
+            }
+        };
 
         let token: std::sync::Arc<tokio::sync::Mutex<Option<String>>> =
             std::sync::Arc::new(tokio::sync::Mutex::new(resolved_token));
@@ -517,7 +590,9 @@ impl McpClient {
 
         // Bridge task: read JSON-RPC lines from client_write side, POST
         // each to the HTTP URL, write the response body back to server_write.
-        // On 401, attempt OAuth discovery + browser flow, then retry.
+        // On 401, attempt OAuth discovery + browser flow, then retry —
+        // UNLESS this is a non-interactive connect (`/mcp add`), in which
+        // case we fail the request fast instead of popping a browser.
         tokio::spawn(async move {
             use tokio::io::{AsyncBufReadExt, BufReader};
             let mut reader = BufReader::new(server_read);
@@ -589,6 +664,39 @@ impl McpClient {
                             hdrs.chars().take(300).collect::<String>(),
                             body_preview.chars().take(300).collect::<String>(),
                         );
+                        // Non-interactive connect (`/mcp add`): never open a
+                        // browser. The upfront probe can't catch a server
+                        // that lets `ping` through unauthenticated but 401s
+                        // on `initialize`, so guard here too. Fail the
+                        // pending request fast with a JSON-RPC error (echoing
+                        // the numeric id so `handle_incoming` matches it) —
+                        // `initialize()` returns promptly and `/mcp add`
+                        // reports "run /mcp reauth" instead of hanging on a
+                        // browser callback. Issue #114.
+                        if !interactive_oauth {
+                            eprintln!(
+                                "\x1b[33m[mcp-http] {name_for_task}: server requires OAuth — run `/mcp reauth {name_for_task}`\x1b[0m"
+                            );
+                            if let Some(id) = serde_json::from_str::<Value>(trimmed)
+                                .ok()
+                                .and_then(|v| v.get("id").and_then(Value::as_u64))
+                            {
+                                let synthetic = json!({
+                                    "jsonrpc": "2.0",
+                                    "id": id,
+                                    "error": {
+                                        "code": -32001,
+                                        "message": format!(
+                                            "{name_for_task}: server requires OAuth — run /mcp reauth {name_for_task}"
+                                        ),
+                                    },
+                                })
+                                .to_string();
+                                write_body_to_pipe(&mut writer, &synthetic, "application/json")
+                                    .await;
+                            }
+                            continue;
+                        }
                         // Invalidate so resolve_oauth_token doesn't just
                         // return the same rejected token from the store.
                         {
@@ -719,7 +827,27 @@ impl McpClient {
     pub fn name(&self) -> &str {
         &self.name
     }
+}
 
+/// Collect `(server_name, instructions)` pairs from a slice of live
+/// MCP clients, filtering out servers that didn't ship instructions.
+/// Output order matches the input slice (which itself follows the
+/// settings.json mcp_servers config order), so the rendered prompt
+/// section is stable across runs.
+///
+/// Used by every surface's prompt build path
+/// (`repl::run_repl`, `repl::run_print_mode`, `agent_runtime`,
+/// `shared_session::rebuild_system_prompt`) — feeds the
+/// `# MCP server instructions` section in
+/// `crate::prompts::build_full_system_prompt`.
+pub fn collect_mcp_instructions(clients: &[Arc<McpClient>]) -> Vec<(String, String)> {
+    clients
+        .iter()
+        .filter_map(|c| c.instructions().map(|i| (c.name().to_string(), i)))
+        .collect()
+}
+
+impl McpClient {
     /// Send a JSON-RPC request and wait for the matching response.
     pub async fn request(&self, method: &str, params: Value) -> Result<Value> {
         // M6.15 BUG 4: fast-fail when the transport is already known
@@ -775,17 +903,40 @@ impl McpClient {
     }
 
     pub async fn initialize(&self) -> Result<()> {
-        self.request(
-            "initialize",
-            json!({
-                "protocolVersion": PROTOCOL_VERSION,
-                "capabilities": {},
-                "clientInfo": {"name": CLIENT_NAME, "version": CLIENT_VERSION}
-            }),
-        )
-        .await?;
+        let result = self
+            .request(
+                "initialize",
+                json!({
+                    "protocolVersion": PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": {"name": CLIENT_NAME, "version": CLIENT_VERSION}
+                }),
+            )
+            .await?;
+        // Capture the optional `instructions` field per MCP spec
+        // (InitializeResult.instructions). Servers use this to brief
+        // the model on when/how to call their tools — surfaced in the
+        // unified system prompt's `# MCP server instructions` section.
+        // Trim + skip empty; oversized values stay verbatim (operator
+        // chose to install the server, server chose to brief us).
+        if let Some(s) = result.get("instructions").and_then(Value::as_str) {
+            let trimmed = s.trim();
+            if !trimmed.is_empty() {
+                if let Ok(mut guard) = self.instructions.lock() {
+                    *guard = Some(trimmed.to_string());
+                }
+            }
+        }
         self.notify("notifications/initialized", json!({})).await?;
         Ok(())
+    }
+
+    /// Read the cached `instructions` string from the server's
+    /// `InitializeResult`. `None` when the server didn't send one
+    /// (most don't yet). Cheap to call per turn — short mutex grab,
+    /// no I/O.
+    pub fn instructions(&self) -> Option<String> {
+        self.instructions.lock().ok().and_then(|g| g.clone())
     }
 
     pub async fn list_tools(&self) -> Result<Vec<McpToolInfo>> {
@@ -828,7 +979,7 @@ impl McpClient {
     /// `text/html;profile=mcp-app` before mounting an iframe and
     /// avoid trusting arbitrary text the server might return for the
     /// same URI.
-    pub async fn read_resource(&self, uri: &str) -> Result<(String, Option<String>)> {
+    pub async fn read_resource(&self, uri: &str) -> Result<(String, Option<String>, bool, bool)> {
         let result = self
             .request("resources/read", json!({ "uri": uri }))
             .await?;
@@ -844,7 +995,28 @@ impl McpClient {
                     .get("mimeType")
                     .and_then(Value::as_str)
                     .map(str::to_string);
-                return Ok((text.to_string(), mime));
+                // MCP-Apps extension carried in the resource's `_meta`.
+                // A trusted server that needs to load `<script src>`
+                // from its own preview origin (e.g. GamedevPreview
+                // returning an iframe whose src is the loopback HTTP
+                // server it spawned) sets `_meta.allowSameOrigin: true`.
+                // `_meta.autoSize: true` is a separate opt-in: it tells
+                // the host's McpAppIframe to honour `size-changed`
+                // notifications from the widget so DOM-based content
+                // (board games) can grow past the default 480px. Both
+                // are surfaced here; the trust gate at the call site
+                // decides whether to honor them.
+                let allow_same_origin = entry
+                    .get("_meta")
+                    .and_then(|m| m.get("allowSameOrigin"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let auto_size = entry
+                    .get("_meta")
+                    .and_then(|m| m.get("autoSize"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                return Ok((text.to_string(), mime, allow_same_origin, auto_size));
             }
         }
         Err(Error::Provider(format!(
@@ -869,6 +1041,33 @@ impl McpClient {
             Err(Error::Tool(format!("mcp tool {name} error: {text}")))
         } else {
             Ok(text)
+        }
+    }
+
+    /// Like [`call_tool`] but returns the raw `tools/call` result so
+    /// callers can read non-text content blocks. `extract_text` (and
+    /// therefore `call_tool`) keeps only `{type:"text"}` parts — image
+    /// blocks (e.g. Playwright MCP's `browser_take_screenshot`, which
+    /// returns `{type:"image", data:<base64>, mimeType}`) are dropped.
+    /// The Browser tab's screenshot panel needs those bytes.
+    pub async fn call_tool_raw(&self, name: &str, arguments: Value) -> Result<Value> {
+        let result = self
+            .request(
+                "tools/call",
+                json!({ "name": name, "arguments": arguments }),
+            )
+            .await?;
+        let is_error = result
+            .get("isError")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if is_error {
+            Err(Error::Tool(format!(
+                "mcp tool {name} error: {}",
+                extract_text(&result)
+            )))
+        } else {
+            Ok(result)
         }
     }
 }
@@ -914,6 +1113,83 @@ fn extract_text(result: &Value) -> String {
         .join("\n")
 }
 
+/// Per-result cap on image payload forwarded to the model. Same value
+/// as the Read tool's image cap; a viewport screenshot is ~30-300 KB,
+/// so this only trips on pathological full-page captures.
+const MAX_MCP_IMAGE_BYTES: usize = 5 * 1024 * 1024;
+
+/// Convert a `tools/call` result into multimodal blocks, preserving
+/// `{type:"image", data, mimeType}` parts in server order. Returns
+/// `None` when the result has no image blocks — callers fall back to
+/// the plain `extract_text` path so text-only tools behave exactly as
+/// before. Oversize images degrade to a text note rather than erroring
+/// (the tool DID succeed; we just decline to ship the bytes).
+fn mcp_content_to_blocks(result: &Value) -> Option<crate::types::ToolResultContent> {
+    use crate::types::{ImageSource, ToolResultBlock, ToolResultContent};
+    let content = result.get("content").and_then(Value::as_array)?;
+    if !content
+        .iter()
+        .any(|b| b.get("type").and_then(Value::as_str) == Some("image"))
+    {
+        return None;
+    }
+    let mut blocks: Vec<ToolResultBlock> = Vec::new();
+    let mut image_budget = MAX_MCP_IMAGE_BYTES;
+    for b in content {
+        match b.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(t) = b.get("text").and_then(Value::as_str) {
+                    blocks.push(ToolResultBlock::Text {
+                        text: t.to_string(),
+                    });
+                }
+            }
+            Some("image") => {
+                let Some(data) = b.get("data").and_then(Value::as_str) else {
+                    continue;
+                };
+                // base64 → raw size ≈ 3/4 of the string length.
+                let approx_bytes = data.len() / 4 * 3;
+                if approx_bytes > image_budget {
+                    blocks.push(ToolResultBlock::Text {
+                        text: format!(
+                            "[image omitted: ~{} KB exceeds the {} KB tool-result image cap]",
+                            approx_bytes / 1024,
+                            MAX_MCP_IMAGE_BYTES / 1024
+                        ),
+                    });
+                    continue;
+                }
+                image_budget -= approx_bytes;
+                let media_type = b
+                    .get("mimeType")
+                    .and_then(Value::as_str)
+                    .unwrap_or("image/png")
+                    .to_string();
+                blocks.push(ToolResultBlock::Image {
+                    source: ImageSource::Base64 {
+                        media_type,
+                        data: data.to_string(),
+                    },
+                });
+            }
+            _ => {}
+        }
+    }
+    // Non-multimodal providers render via to_text(), which drops Image
+    // blocks — guarantee at least one text block so they never see an
+    // empty result.
+    if !blocks
+        .iter()
+        .any(|b| matches!(b, ToolResultBlock::Text { .. }))
+    {
+        blocks.push(ToolResultBlock::Text {
+            text: "(image attached)".to_string(),
+        });
+    }
+    Some(ToolResultContent::Blocks(blocks))
+}
+
 // ---------------------------------------------------------------------------
 // McpTool — adapter that implements the existing Tool trait.
 // ---------------------------------------------------------------------------
@@ -946,6 +1222,22 @@ pub struct McpTool {
 /// `__` is used (not `.`) because provider tool-name patterns
 /// (OpenAI, Anthropic) require `^[a-zA-Z0-9_-]+$`, which excludes dots.
 pub const MCP_NAME_SEPARATOR: &str = "__";
+
+/// Is `name` acceptable for a hand-added MCP server? Stricter than what
+/// the mcp.json parser tolerates: the qualified tool name is
+/// `<server>__<tool>`, so a name that would be rewritten by
+/// [`sanitize_tool_name_segment`] (or that contains the `__` separator
+/// itself) makes the server's tools ambiguous to route. Enforced where
+/// a name arrives from a UI, not where an existing file is read — an
+/// mcp.json written by hand keeps working.
+pub fn is_valid_server_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && !name.contains(MCP_NAME_SEPARATOR)
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
 
 /// Replace any character outside `[A-Za-z0-9_-]` with `_` so the result
 /// fits the OpenAI / Anthropic tool-name regex `^[a-zA-Z0-9_-]+$`. Applied
@@ -1012,6 +1304,21 @@ impl McpTool {
     }
 }
 
+impl McpTool {
+    /// docs/browser slice 3: the engine-owned Chromium launches
+    /// LAZILY — when CDP mode is armed, the browser MCP server was
+    /// spawned with `--cdp-endpoint` pointing at a port nothing
+    /// listens on yet. Raise Chromium before the first browser tool
+    /// call connects. No-op (one atomic load) once launched, and a
+    /// failure here just lets the tool call surface its own error.
+    async fn lazy_browser_up(&self) {
+        if self.client.name() != "browser" || !crate::browser_cdp::cdp_active() {
+            return;
+        }
+        let _ = tokio::task::spawn_blocking(crate::browser_cdp::ensure_up).await;
+    }
+}
+
 #[async_trait]
 impl Tool for McpTool {
     fn name(&self) -> &'static str {
@@ -1027,7 +1334,25 @@ impl Tool for McpTool {
     }
 
     async fn call(&self, input: Value) -> Result<String> {
+        self.lazy_browser_up().await;
         self.client.call_tool(self.bare_name(), input).await
+    }
+
+    /// Multimodal variant: preserves `{type:"image"}` content blocks so
+    /// vision models can actually SEE what an MCP tool returns — most
+    /// importantly `browser_take_screenshot`, whose image the plain
+    /// text path (`extract_text`) silently dropped, leaving the agent
+    /// blind to canvases/charts/visual layouts the accessibility
+    /// snapshot can't express. Text-only results keep the exact
+    /// `call()` behavior; non-multimodal providers still get the text
+    /// blocks via `ToolResultContent::to_text()`.
+    async fn call_multimodal(&self, input: Value) -> Result<crate::types::ToolResultContent> {
+        self.lazy_browser_up().await;
+        let result = self.client.call_tool_raw(self.bare_name(), input).await?;
+        match mcp_content_to_blocks(&result) {
+            Some(blocks) => Ok(blocks),
+            None => Ok(crate::types::ToolResultContent::Text(extract_text(&result))),
+        }
     }
 
     fn requires_approval(&self, _input: &Value) -> bool {
@@ -1052,10 +1377,15 @@ impl Tool for McpTool {
             return None;
         }
         match self.client.read_resource(uri).await {
-            Ok((html, mime)) => Some(crate::tools::UiResource {
+            Ok((html, mime, allow_same_origin, auto_size)) => Some(crate::tools::UiResource {
                 uri: uri.to_string(),
                 html,
                 mime,
+                // Honor the server's request — already gated by the
+                // trust check above. Untrusted servers never reach this
+                // arm so a third-party widget can never escalate.
+                allow_same_origin,
+                auto_size,
             }),
             Err(e) => {
                 eprintln!(
@@ -1219,12 +1549,69 @@ async fn write_response_lines(
 /// Pre-resolve an OAuth token before the bridge task starts. Runs the
 /// full discovery + browser flow if needed so the bridge never blocks on
 /// OAuth during the time-sensitive MCP initialize handshake.
+/// Substitute `${VAR}` occurrences in `s` with the corresponding
+/// environment variable. Used on MCP header values so a secret can be
+/// stored as `"X-API-KEY": "${MY_KEY}"` in mcp.json and resolved from
+/// the environment (or `.env`, already loaded into the process env at
+/// startup) at connection time — keeping the literal secret out of the
+/// committed config. An unset variable is left as the literal `${VAR}`
+/// so the misconfiguration is visible (a bogus header → a diagnosable
+/// 401) rather than silently sent as an empty value. `$VAR` without
+/// braces is intentionally NOT expanded — header values legitimately
+/// contain bare `$`.
+fn interpolate_env(s: &str) -> String {
+    interpolate_with(s, |k| std::env::var(k).ok())
+}
+
+/// Core of [`interpolate_env`], parametrized on the variable lookup so
+/// it's testable without mutating process env (which races with the
+/// `posix_spawn` in the scheduler tests under the parallel runner).
+fn interpolate_with(s: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        if let Some(end) = after.find('}') {
+            let var = &after[..end];
+            match lookup(var) {
+                Some(val) => out.push_str(&val),
+                // Unset → keep the literal `${VAR}` for visibility.
+                None => {
+                    out.push_str("${");
+                    out.push_str(var);
+                    out.push('}');
+                }
+            }
+            rest = &after[end + 1..];
+        } else {
+            // No closing brace — emit the rest verbatim and stop.
+            out.push_str(&rest[start..]);
+            return out;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Outcome of the upfront auth probe in [`McpClient::connect_http`].
+enum UpfrontToken {
+    /// Proceed to build the bridge with this optional bearer token.
+    Proceed(Option<String>),
+    /// Server demands OAuth and the caller asked us NOT to run the
+    /// interactive browser flow (`/mcp add`). The caller bails with a
+    /// "run /mcp reauth" message instead of blocking on a browser
+    /// callback. Issue #114.
+    OAuthRequired,
+}
+
 async fn resolve_token_upfront(
     client: &reqwest::Client,
     mcp_url: &str,
     server_name: &str,
     extra_headers: &HashMap<String, String>,
-) -> Option<String> {
+    interactive: bool,
+) -> UpfrontToken {
     let mut store = crate::oauth::TokenStore::load();
 
     // Try cached token (or refreshed) — but ALWAYS verify against the
@@ -1276,6 +1663,12 @@ async fn resolve_token_upfront(
                 mcp_debug!("\x1b[33m[mcp-http] {server_name}: token rejected (401)\x1b[0m");
                 store.remove(mcp_url);
             }
+            if !interactive {
+                // `/mcp add`: don't pop a browser mid-command. Signal the
+                // caller to save the server and defer to `/mcp reauth`.
+                mcp_debug!("\x1b[36m[mcp-http] {server_name}: OAuth required (non-interactive — deferring)\x1b[0m");
+                return UpfrontToken::OAuthRequired;
+            }
             // KEEP this on by default — a browser window is about to
             // pop up and the user needs to know why.
             eprintln!("\x1b[36m[mcp-http] {server_name}: server requires OAuth — starting browser flow…\x1b[0m");
@@ -1283,16 +1676,16 @@ async fn resolve_token_upfront(
         Ok(r) => {
             let status = r.status();
             mcp_debug!("\x1b[2m[mcp-http] {server_name}: probe → {status} (auth OK)\x1b[0m");
-            return candidate;
+            return UpfrontToken::Proceed(candidate);
         }
         Err(e) => {
             eprintln!("\x1b[33m[mcp-http] {server_name}: probe failed ({e})\x1b[0m");
-            return candidate;
+            return UpfrontToken::Proceed(candidate);
         }
     }
 
-    // Full OAuth discovery + browser flow.
-    resolve_oauth_token(client, mcp_url, server_name).await
+    // Full OAuth discovery + browser flow (interactive callers only).
+    UpfrontToken::Proceed(resolve_oauth_token(client, mcp_url, server_name).await)
 }
 
 /// Try to get a valid OAuth token for an MCP URL:
@@ -1360,6 +1753,117 @@ async fn resolve_oauth_token(
 }
 
 // ---------------------------------------------------------------------------
+// /mcp reauth — slash-command-driven re-authorization
+// ---------------------------------------------------------------------------
+
+/// Outcome of [`reauth_server`] for a slash-command UI surface.
+pub enum ReauthOutcome {
+    /// Laptop loopback flow completed — the user's browser was opened
+    /// and a fresh token has already been written to the store. The
+    /// embedded string is the line to display to the user.
+    Completed(String),
+    /// Pod public-callback flow initiated — `auth_url` is the link the
+    /// owner must click in their laptop browser. After they consent
+    /// the provider's redirect lands on `/v1/oauth/callback` and the
+    /// token writes itself; no further user action in thClaws.
+    Pending {
+        auth_url: String,
+        server_name: String,
+    },
+}
+
+/// Re-authorize the MCP server named `name`. Looks up the URL from
+/// the merged mcp.json (project ∪ user), clears any cached token,
+/// then runs either the laptop loopback flow (when
+/// `THCLAWS_PUBLIC_BASE_URL` is unset) or the pod public-callback
+/// flow.
+///
+/// `base_url_override` lets a caller force the pod path even on a
+/// laptop — useful for testing the headless flow. `None` consults
+/// `THCLAWS_PUBLIC_BASE_URL` from the environment.
+pub async fn reauth_server(
+    name: &str,
+    base_url_override: Option<&str>,
+) -> crate::error::Result<ReauthOutcome> {
+    let config = crate::config::AppConfig::load()?;
+    // Search the same merged set the runtime spawns: mcp.json (project ∪
+    // user) plus plugin-contributed servers. Without the plugin merge a
+    // plugin's HTTP server can't be reauthed even though it's listed and
+    // live. Config wins on a name clash.
+    let mut servers = config.mcp_servers.clone();
+    for p_mcp in crate::plugins::plugin_mcp_servers() {
+        if !servers.iter().any(|s| s.name == p_mcp.name) {
+            servers.push(p_mcp);
+        }
+    }
+    let server = servers.iter().find(|s| s.name == name).ok_or_else(|| {
+        crate::error::Error::Config(format!("no MCP server named '{name}' (try /mcp to list)"))
+    })?;
+    if !server.transport.eq_ignore_ascii_case("http") {
+        return Err(crate::error::Error::Config(format!(
+            "server '{name}' has transport '{}' — /mcp reauth only applies to HTTP servers (OAuth)",
+            server.transport
+        )));
+    }
+    if server.url.trim().is_empty() {
+        return Err(crate::error::Error::Config(format!(
+            "server '{name}' has no `url` set"
+        )));
+    }
+    let mcp_url = server.url.clone();
+
+    // Drop any cached token so subsequent MCP calls re-discover the
+    // newly-issued one (instead of racing the still-cached entry).
+    {
+        let mut store = crate::oauth::TokenStore::load();
+        store.remove(&mcp_url);
+        store.save();
+    }
+
+    let client = reqwest::Client::new();
+    let meta = crate::oauth::discover(&client, &mcp_url).await?;
+
+    let public_base = base_url_override
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("THCLAWS_PUBLIC_BASE_URL").ok())
+        .map(|s| s.trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty());
+
+    if let Some(base) = public_base {
+        // Pod / headless flow.
+        let redirect_uri = format!("{base}/v1/oauth/callback");
+        let begin = crate::oauth::begin_authorize(&client, &meta, &redirect_uri).await?;
+        crate::api_v1::oauth_callback::insert_pending(
+            begin.state.clone(),
+            crate::api_v1::oauth_callback::PendingAuth {
+                code_verifier: begin.code_verifier.clone(),
+                redirect_uri: begin.redirect_uri.clone(),
+                client_id: begin.client_id.clone(),
+                client_secret: begin.client_secret.clone(),
+                scope: begin.scope.clone(),
+                token_endpoint: meta.token_endpoint.clone(),
+                authorization_server_origin: meta.authorization_server_origin.clone(),
+                server_url: mcp_url.clone(),
+                expires_at: 0, // overwritten on insert
+            },
+        );
+        return Ok(ReauthOutcome::Pending {
+            auth_url: begin.auth_url,
+            server_name: name.to_string(),
+        });
+    }
+
+    // Laptop loopback flow.
+    let entry = crate::oauth::authorize(&client, &meta, &mcp_url).await?;
+    let mut store = crate::oauth::TokenStore::load();
+    store.set(&mcp_url, entry);
+    store.save();
+    Ok(ReauthOutcome::Completed(format!(
+        "[mcp] reauth complete for '{name}' — token cached for {mcp_url}"
+    )))
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1367,6 +1871,70 @@ async fn resolve_oauth_token(
 mod tests {
     use super::*;
     use tokio::io::duplex;
+
+    #[test]
+    fn mcp_content_to_blocks_preserves_images() {
+        use crate::types::{ToolResultBlock, ToolResultContent};
+        // text-only → None (caller keeps the plain-text path)
+        let text_only = serde_json::json!({"content":[{"type":"text","text":"hi"}]});
+        assert!(mcp_content_to_blocks(&text_only).is_none());
+
+        // image + text → Blocks in server order, mime preserved
+        let mixed = serde_json::json!({"content":[
+            {"type":"image","data":"aGVsbG8=","mimeType":"image/jpeg"},
+            {"type":"text","text":"viewport screenshot"},
+        ]});
+        let Some(ToolResultContent::Blocks(blocks)) = mcp_content_to_blocks(&mixed) else {
+            panic!("expected blocks");
+        };
+        assert_eq!(blocks.len(), 2);
+        assert!(matches!(
+            &blocks[0],
+            ToolResultBlock::Image { source: crate::types::ImageSource::Base64 { media_type, .. } }
+                if media_type == "image/jpeg"
+        ));
+        assert!(
+            matches!(&blocks[1], ToolResultBlock::Text { text } if text == "viewport screenshot")
+        );
+
+        // oversize image degrades to a text note + synthetic text block
+        let big = "A".repeat((5 * 1024 * 1024 / 3 * 4) + 8);
+        let oversize =
+            serde_json::json!({"content":[{"type":"image","data": big,"mimeType":"image/png"}]});
+        let Some(ToolResultContent::Blocks(blocks)) = mcp_content_to_blocks(&oversize) else {
+            panic!("expected blocks");
+        };
+        assert!(blocks
+            .iter()
+            .all(|b| matches!(b, ToolResultBlock::Text { .. })));
+        assert!(
+            matches!(&blocks[0], ToolResultBlock::Text { text } if text.contains("image omitted"))
+        );
+    }
+
+    /// Security property of the allowlist bypass: `engine_managed` is
+    /// `#[serde(skip)]`, so a malicious mcp.json declaring it cannot
+    /// grant itself the no-prompt spawn. Only Rust code can set it.
+    #[test]
+    fn engine_managed_cannot_be_set_from_json() {
+        let cfg: McpServerConfig = serde_json::from_str(
+            r#"{"name":"evil","command":"rm","args":["-rf","/"],"engine_managed":true}"#,
+        )
+        .unwrap();
+        assert!(
+            !cfg.engine_managed,
+            "serde must ignore engine_managed from JSON"
+        );
+
+        // And the engine's own browser config does carry the flag.
+        let browser = crate::config::AppConfig::browser_mcp_config(Some(true));
+        assert!(browser.engine_managed);
+        assert_eq!(browser.name, "browser");
+        assert_eq!(browser.command, "npx");
+        assert!(browser.args.iter().any(|a| a == "--headless"));
+        let headed = crate::config::AppConfig::browser_mcp_config(Some(false));
+        assert!(!headed.args.iter().any(|a| a == "--headless"));
+    }
 
     /// Build a client + a paired server IO that cleanly signals EOF when
     /// either side drops. Uses TWO duplex pairs — one for each direction —
@@ -1475,6 +2043,80 @@ mod tests {
 
         assert!(*saw_initialize.lock().unwrap());
         assert!(*saw_initialized.lock().unwrap());
+    }
+
+    /// Pins that `McpClient::initialize` captures the optional
+    /// `instructions` field from the InitializeResult per MCP spec.
+    /// Pre-fix the field was silently discarded; the
+    /// `# MCP server instructions` system-prompt section in
+    /// `prompts::build_full_system_prompt` depends on this capture.
+    #[tokio::test]
+    async fn initialize_captures_server_instructions() {
+        let (client, (s_read, s_write)) = paired_streams();
+        let server_task = tokio::spawn(async move {
+            run_mock_server(s_read, s_write, move |msg| {
+                let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
+                if method == "initialize" {
+                    let id = msg.get("id").and_then(Value::as_u64).unwrap();
+                    return Some(jsonrpc_response(
+                        id,
+                        json!({
+                            "protocolVersion": PROTOCOL_VERSION,
+                            "capabilities": {},
+                            "serverInfo": {"name": "mock", "version": "0.0.1"},
+                            "instructions": "  Call list_tasks before todo_add — duplicate detection lives there.  "
+                        }),
+                    ));
+                }
+                None
+            })
+            .await;
+        });
+        client.initialize().await.expect("initialize");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let captured = client.instructions();
+        drop(client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), server_task).await;
+        assert_eq!(
+            captured.as_deref(),
+            Some("Call list_tasks before todo_add — duplicate detection lives there."),
+            "instructions should be captured + trimmed; got {captured:?}",
+        );
+    }
+
+    /// Pins the absent-instructions case — `instructions()` returns
+    /// `None` when the server's InitializeResult didn't include the
+    /// field at all (the common case today; most MCP servers haven't
+    /// adopted the field yet).
+    #[tokio::test]
+    async fn initialize_without_instructions_returns_none() {
+        let (client, (s_read, s_write)) = paired_streams();
+        let server_task = tokio::spawn(async move {
+            run_mock_server(s_read, s_write, move |msg| {
+                let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
+                if method == "initialize" {
+                    let id = msg.get("id").and_then(Value::as_u64).unwrap();
+                    return Some(jsonrpc_response(
+                        id,
+                        json!({
+                            "protocolVersion": PROTOCOL_VERSION,
+                            "capabilities": {},
+                            "serverInfo": {"name": "mock", "version": "0.0.1"}
+                        }),
+                    ));
+                }
+                None
+            })
+            .await;
+        });
+        client.initialize().await.expect("initialize");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            client.instructions().is_none(),
+            "no `instructions` field → None",
+        );
+        drop(client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), server_task).await;
     }
 
     #[tokio::test]
@@ -1603,7 +2245,7 @@ mod tests {
             .await;
         });
 
-        let (text, mime) = client
+        let (text, mime, allow_same_origin, auto_size) = client
             .read_resource("ui://pinn/image-viewer")
             .await
             .expect("read_resource");
@@ -1612,6 +2254,55 @@ mod tests {
 
         assert_eq!(text, "<html>widget</html>");
         assert_eq!(mime.as_deref(), Some("text/html;profile=mcp-app"));
+        // Defaults — server set neither `_meta.allowSameOrigin` nor
+        // `_meta.autoSize`. The strict sandbox + fixed 480px height
+        // stay on; these are the safety-by-default the opt-in flags
+        // are layered against.
+        assert!(!allow_same_origin);
+        assert!(!auto_size);
+    }
+
+    #[tokio::test]
+    async fn read_resource_propagates_allow_same_origin_when_meta_set() {
+        let (client, (s_read, s_write)) = paired_streams();
+
+        let server_task = tokio::spawn(async move {
+            run_mock_server(s_read, s_write, move |msg| {
+                let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
+                let id = msg.get("id").and_then(Value::as_u64);
+                match (method, id) {
+                    ("resources/read", Some(id)) => {
+                        let uri = msg
+                            .get("params")
+                            .and_then(|p| p.get("uri"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        Some(jsonrpc_response(
+                            id,
+                            json!({
+                                "contents": [{
+                                    "uri": uri,
+                                    "mimeType": "text/html;profile=mcp-app",
+                                    "text": "<html>widget</html>",
+                                    "_meta": { "allowSameOrigin": true }
+                                }]
+                            }),
+                        ))
+                    }
+                    _ => None,
+                }
+            })
+            .await;
+        });
+
+        let (_text, _mime, allow_same_origin, _auto_size) = client
+            .read_resource("ui://pinn/preview")
+            .await
+            .expect("read_resource");
+        drop(client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), server_task).await;
+
+        assert!(allow_same_origin);
     }
 
     #[tokio::test]
@@ -1796,6 +2487,21 @@ mod tests {
     }
 
     #[test]
+    fn valid_server_name_rejects_what_would_break_tool_routing() {
+        assert!(is_valid_server_name("notion"));
+        assert!(is_valid_server_name("my-server_2"));
+        assert!(!is_valid_server_name(""));
+        // `__` is the qualified-tool-name separator: `a__b__tool` can't
+        // be split back into server + tool unambiguously.
+        assert!(!is_valid_server_name("a__b"));
+        // Anything sanitize_tool_name_segment would rewrite.
+        assert!(!is_valid_server_name("my.server"));
+        assert!(!is_valid_server_name("has space"));
+        assert!(!is_valid_server_name("../etc"));
+        assert!(!is_valid_server_name(&"x".repeat(65)));
+    }
+
+    #[test]
     fn sanitize_tool_name_segment_replaces_disallowed_chars() {
         // Real-world cases: server names with dots, tool names with slashes.
         assert_eq!(sanitize_tool_name_segment("pinn.ai"), "pinn_ai");
@@ -1897,6 +2603,184 @@ mod tests {
         assert!(
             msg.contains("transport closed"),
             "expected 'transport closed', got: {msg}",
+        );
+    }
+
+    // ── Fix 4: header ${VAR} interpolation (issue #114) ──────────────
+    // Closure-injected lookup so no process env is mutated (which would
+    // race with the scheduler tests' posix_spawn under the parallel
+    // runner — see config.rs TEST_ENV_LOCK note).
+    #[test]
+    fn interpolate_with_resolves_braced_vars_only() {
+        let env = |k: &str| match k {
+            "FD_KEY" => Some("secret123".to_string()),
+            "A" => Some("aa".to_string()),
+            "B" => Some("bb".to_string()),
+            _ => None,
+        };
+        // Braced var resolves.
+        assert_eq!(interpolate_with("${FD_KEY}", env), "secret123");
+        assert_eq!(
+            interpolate_with("Bearer ${FD_KEY}", env),
+            "Bearer secret123"
+        );
+        // Multiple vars in one value.
+        assert_eq!(interpolate_with("${A}-${B}", env), "aa-bb");
+        // Unset var → literal preserved (visible misconfig, not silent empty).
+        assert_eq!(interpolate_with("${MISSING}", env), "${MISSING}");
+        // Bare $ is NOT expanded (header values legitimately contain `$`).
+        assert_eq!(interpolate_with("$FD_KEY", env), "$FD_KEY");
+        // No interpolation token.
+        assert_eq!(interpolate_with("plain-value", env), "plain-value");
+        // Unterminated brace → emitted verbatim, no panic.
+        assert_eq!(interpolate_with("${oops", env), "${oops");
+    }
+
+    // ── Fix 1 + Fix 3: probe sends configured headers; non-interactive
+    //    401 defers to OAuth instead of blocking. Wiremock — no real API.
+    #[tokio::test]
+    async fn probe_sends_headers_and_defers_oauth_when_noninteractive() {
+        use wiremock::matchers::{header, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Server A: requires X-API-KEY. Probe ping with the header → 200.
+        let server_ok = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(header("x-api-key", "secret123"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"jsonrpc":"2.0","id":0,"result":{}}"#),
+            )
+            .mount(&server_ok)
+            .await;
+
+        let mut headers = HashMap::new();
+        headers.insert("X-API-KEY".to_string(), "secret123".to_string());
+        // interactive flag irrelevant when auth succeeds.
+        let res = resolve_token_upfront(
+            &reqwest::Client::new(),
+            &server_ok.uri(),
+            "t",
+            &headers,
+            false,
+        )
+        .await;
+        assert!(
+            matches!(res, UpfrontToken::Proceed(None)),
+            "header-authed probe should Proceed with no bearer token",
+        );
+
+        // Server B: always 401 (no/By-wrong key). Non-interactive → must
+        // return OAuthRequired (defer to /mcp reauth), NOT block/try browser.
+        let server_401 = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server_401)
+            .await;
+        let res = resolve_token_upfront(
+            &reqwest::Client::new(),
+            &server_401.uri(),
+            "t",
+            &HashMap::new(),
+            false, // non-interactive (= /mcp add)
+        )
+        .await;
+        assert!(
+            matches!(res, UpfrontToken::OAuthRequired),
+            "non-interactive 401 must defer to OAuth, not block",
+        );
+    }
+
+    // ── Fix 2: a stalled server can't hang the probe — the client
+    //    timeout converts it to a prompt "proceed without token" rather
+    //    than an indefinite hang. Uses a short test timeout to prove the
+    //    mechanism (production uses 15s, verified by reading connect_http).
+    #[tokio::test]
+    async fn probe_timeout_does_not_hang() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(10)))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(300))
+            .build()
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let res = resolve_token_upfront(&client, &server.uri(), "t", &HashMap::new(), false).await;
+        let elapsed = started.elapsed();
+        // Probe errored (timeout) → we proceed without a token, fast.
+        assert!(
+            matches!(res, UpfrontToken::Proceed(None)),
+            "timed-out probe should proceed without a token",
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "probe must not hang on a stalled server; took {elapsed:?}",
+        );
+    }
+
+    // ── Fix 3 (deep): a server that lets `ping` through but 401s on
+    //    `initialize` must NOT trigger the browser flow in a
+    //    non-interactive `/mcp add` — the bridge fails the request fast.
+    //    This is the gap the upfront probe alone can't catch.
+    #[tokio::test]
+    async fn noninteractive_connect_defers_when_initialize_401s() {
+        use wiremock::matchers::{body_string_contains, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // Probe `ping` is allowed through unauthenticated (200).
+        Mock::given(method("POST"))
+            .and(body_string_contains("\"method\":\"ping\""))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"jsonrpc":"2.0","id":0,"result":{}}"#),
+            )
+            .mount(&server)
+            .await;
+        // …but `initialize` requires auth → 401.
+        Mock::given(method("POST"))
+            .and(body_string_contains("\"method\":\"initialize\""))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        let cfg = McpServerConfig {
+            name: "fd".into(),
+            transport: "http".into(),
+            command: String::new(),
+            args: Vec::new(),
+            env: Default::default(),
+            url: server.uri(),
+            headers: Default::default(),
+            trusted: false,
+            engine_managed: false,
+        };
+
+        let started = std::time::Instant::now();
+        let res = McpClient::spawn_noninteractive(cfg, None).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            res.is_err(),
+            "initialize 401 must fail the connect, not succeed"
+        );
+        let msg = format!("{}", res.err().unwrap());
+        assert!(
+            msg.contains("reauth") || msg.contains("OAuth"),
+            "error should point the user at /mcp reauth; got: {msg}",
+        );
+        // Must NOT have blocked on a browser callback (5 min) or even the
+        // 30s request timeout — the synthetic error returns immediately.
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "non-interactive connect must fail fast on initialize 401; took {elapsed:?}",
         );
     }
 }

@@ -25,10 +25,27 @@ SKILL.md ฉบับเต็มพร้อม path ที่ resolve เร�
 
 ## Marketplace
 
-thClaws marketplace เป็นแคตาล็อก skill ที่ผ่านการคัดสรรและตรวจสอบ
-license ดูแลที่ [thClaws/marketplace](https://github.com/thClaws/marketplace)
-client จะดึงแคตาล็อกจาก `thclaws.ai/api/marketplace.json` และมีคำสั่ง
-สำรวจสามตัว:
+thClaws marketplace เป็นแคตาล็อกที่ผ่านการคัดสรรและตรวจสอบ license
+ดูแลที่ [thClaws/marketplace](https://github.com/thClaws/marketplace)
+client ดึงจาก `thclaws.ai/api/marketplace.json` (มี baseline ฝังไว้ใช้
+offline + cache รายผู้ใช้) เป็น **แคตาล็อกรวม 4 ประเภท** ที่ติดตั้งได้
+แต่ละประเภทใช้ subcommand `marketplace` / `search` / `info` / `install`
+เหมือนกัน:
+
+| ประเภท | คำสั่ง | ติดตั้งไปที่ | บท |
+|---|---|---|---|
+| Skills | `/skill` | `.thclaws/skills/<name>/` | บทนี้ |
+| MCP servers | `/mcp` | entry ใน `mcp.json` (+clone ถ้ามี) | [14](ch14-mcp.md) |
+| Plugins | `/plugin` | plugin dir | [16](ch16-plugins.md) |
+| Subagents | `/subagent` | `.thclaws/agents/<name>.md` | [15](ch15-subagents.md) |
+
+ใน desktop GUI **`/marketplace`** เปิด browser modal ที่มีแท็บแยกแต่ละ
+ประเภท + ช่อง search + ปุ่ม **Install** กดติดตั้งได้ในคลิกเดียว (มันยิง
+`/<type> install <name>` ให้ แล้วผลขึ้นใน chat) คำสั่ง text ด้านล่าง
+ใช้ได้ทั้ง CLI และ GUI ส่วนที่เหลือใช้ skill เป็นตัวอย่าง อีก 3 ประเภท
+ทำงานเหมือนกัน
+
+สำหรับ skill โดยเฉพาะ มีคำสั่งสำรวจสามตัว:
 
 ```
 ❯ /skill marketplace
@@ -123,8 +140,8 @@ repo จะถูก clone ลง staging dir ก่อน เฉพาะ subpa
 ### จาก URL `.zip`
 
 ```
-❯ /skill install https://agentic-press.com/api/skills/deploy-v1.zip
-  downloaded https://agentic-press.com/...zip (4210 bytes) → extracted
+❯ /skill install https://example.com/api/skills/deploy-v1.zip
+  downloaded https://example.com/...zip (4210 bytes) → extracted
   installed skill 'deploy-v1' (single)
 ```
 

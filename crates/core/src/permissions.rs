@@ -43,11 +43,20 @@ pub enum PermissionMode {
     /// approve agent-initiated mutations from their phone when the
     /// LINE bridge is active.
     LineGated,
-    /// Telegram-gated — same as `LineGated` but routes approvals
-    /// to Telegram via inline keyboard buttons. Used when the
-    /// Telegram bridge is active. Only authorized chat_ids
-    /// (from `allowed_chat_ids` in config) can approve.
+    /// Telegram-gated (dev-plan/29 Tier 1) — the Telegram analogue of
+    /// [`Self::LineGated`]. Same gating semantics (every tool whose
+    /// `requires_approval` returns true), but the prompt is routed to
+    /// the user's Telegram chat as an inline keyboard via the
+    /// `TelegramApprover` sink. The plan generalises both into a single
+    /// `BotGated` mode in Tier 2; kept parallel for Tier 1 to avoid
+    /// churning the LINE path.
     TelegramGated,
+    /// Messenger-gated (dev-plan/31) — the Facebook Page Messenger
+    /// analogue of [`Self::LineGated`]. Same gating semantics; the
+    /// prompt is routed to the Messenger thread as quick replies via
+    /// the `MessengerApprover` sink. Folds into `BotGated` alongside
+    /// the others in Tier 2.
+    MessengerGated,
 }
 
 impl PermissionMode {
@@ -55,7 +64,10 @@ impl PermissionMode {
     /// calls. Centralised so a future "Slack-gated" / "Discord-
     /// gated" variant just opts into the same arm.
     pub fn asks_for_approval(&self) -> bool {
-        matches!(self, Self::Ask | Self::LineGated | Self::TelegramGated)
+        matches!(
+            self,
+            Self::Ask | Self::LineGated | Self::TelegramGated | Self::MessengerGated
+        )
     }
 
     /// True when this mode blocks mutating calls outright (Plan
@@ -318,10 +330,10 @@ impl ApprovalSink for ReplApprover {
         if self.session_allowed.load(Ordering::Relaxed) {
             return ApprovalDecision::Allow;
         }
-        let preview = req
-            .summary
-            .clone()
-            .unwrap_or_else(|| serde_json::to_string(&req.input).unwrap_or_default());
+        let preview = req.summary.clone().unwrap_or_else(|| {
+            serde_json::to_string(&crate::tool_display::redact_json_value(&req.input))
+                .unwrap_or_default()
+        });
         let prompt = format!(
             "\n\x1b[33m[approval] {} input={}\x1b[0m\n\x1b[90m[y]es / [n]o / yolo ▸ \x1b[0m",
             req.tool_name, preview

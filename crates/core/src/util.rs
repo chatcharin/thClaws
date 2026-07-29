@@ -126,11 +126,106 @@ pub fn shell_command_sync(command: &str) -> std::process::Command {
     let mut c = std::process::Command::new(shell);
     c.arg(flag).arg(command);
 
-    // for Windows creation flag to hide the console window
     #[cfg(target_os = "windows")]
-    c.creation_flags(0x08000000);
+    {
+        if let Some(dir) = windows_python_shim_dir() {
+            let path = std::env::var("PATH").unwrap_or_default();
+            c.env("PATH", format!("{};{}", dir.display(), path));
+        }
+        // hide the console window
+        c.creation_flags(0x08000000);
+    }
 
     c
+}
+
+/// Windows ships `py` (the launcher) and `python`, but not a real `python3` —
+/// the bare `python3` name resolves to a Microsoft Store stub that just opens
+/// the Store. Agents invoke `python3 …` (works on Linux/macOS), so on Windows we
+/// shadow it with a tiny `.bat` shim that forwards to a real interpreter and
+/// prepend the shim dir to the child's PATH. Detection + write happen once
+/// (cached); returns `None` when no Python is present (nothing to shim).
+#[cfg(target_os = "windows")]
+fn windows_python_shim_dir() -> Option<&'static std::path::Path> {
+    use std::os::windows::process::CommandExt;
+    use std::sync::OnceLock;
+    static DIR: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let on_path = |name: &str| -> bool {
+            std::process::Command::new("where")
+                .arg(name)
+                .creation_flags(0x08000000)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        let (py_fwd, pip_fwd) = if on_path("py") {
+            ("py -3", "py -3 -m pip")
+        } else if on_path("python") {
+            ("python", "python -m pip")
+        } else {
+            return None;
+        };
+        let dir = std::env::temp_dir().join("thclaws-python-shim");
+        if std::fs::create_dir_all(&dir).is_err() {
+            return None;
+        }
+        let _ = std::fs::write(
+            dir.join("python3.bat"),
+            format!("@echo off\r\n{py_fwd} %*\r\n"),
+        );
+        let _ = std::fs::write(
+            dir.join("pip3.bat"),
+            format!("@echo off\r\n{pip_fwd} %*\r\n"),
+        );
+        Some(dir)
+    })
+    .as_deref()
+}
+
+/// Re-execute the current thclaws binary in place. Used by the
+/// `/reload` slash command to drop in-memory state (MCP handles,
+/// system prompt, skill caches, etc.) without needing an external
+/// supervisor — on-disk sessions survive, so the user can resume.
+///
+/// Behaviour by platform:
+/// - **Unix**: `execv` the same binary with the same argv. The
+///   process keeps its PID, all in-memory state is replaced. Only
+///   returns on error.
+/// - **Windows**: no `execv`; spawn a fresh process with the same
+///   command line, then exit. The new process gets a new PID.
+///
+/// Mostly equivalent to a `/v1/restart` on the pod side, but
+/// without involving Kubernetes — useful on a laptop where there's
+/// no supervisor to bring the process back.
+pub fn reexec_self() -> std::io::Error {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let mut c = std::process::Command::new(&exe);
+        c.args(&args);
+        // exec() only returns on failure; on success the current
+        // process image is replaced.
+        c.exec()
+    }
+    #[cfg(not(unix))]
+    {
+        let res = std::process::Command::new(&exe).args(&args).spawn();
+        match res {
+            Ok(_) => {
+                std::process::exit(0);
+            }
+            Err(e) => e,
+        }
+    }
 }
 
 /// Async variant for tokio-based call sites (currently the Bash
@@ -140,9 +235,17 @@ pub fn shell_command_async(command: &str) -> tokio::process::Command {
     let mut c = tokio::process::Command::new(shell);
     c.arg(flag).arg(command);
 
-    // for Windows creation flag to hide the console window
     #[cfg(target_os = "windows")]
-    c.creation_flags(0x08000000);
+    {
+        // Agents invoke `python3`, which Windows doesn't ship (bare `python3`
+        // is a Store stub). Prepend a shim that forwards to `py -3` / `python`.
+        if let Some(dir) = windows_python_shim_dir() {
+            let path = std::env::var("PATH").unwrap_or_default();
+            c.env("PATH", format!("{};{}", dir.display(), path));
+        }
+        // hide the console window
+        c.creation_flags(0x08000000);
+    }
 
     c
 }
@@ -152,7 +255,7 @@ pub fn shell_command_async(command: &str) -> tokio::process::Command {
 /// string like `"bash -c"` or `"pwsh -Command"` and we split on
 /// whitespace; the first token is the executable, the second is the
 /// flag.
-fn shell_invocation() -> (String, String) {
+pub(crate) fn shell_invocation() -> (String, String) {
     if let Ok(s) = std::env::var("THCLAWS_SHELL") {
         let parts: Vec<&str> = s.split_whitespace().collect();
         if parts.len() == 2 {

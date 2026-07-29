@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { X, ArrowLeft, Loader2 } from "lucide-react";
+import { X, ArrowLeft, Loader2, Pencil, Save } from "lucide-react";
 import { marked } from "marked";
 import { send, subscribe } from "../hooks/useIPC";
+import { assetUrl } from "../lib/assetUrl";
+import { MarkdownEditor } from "./MarkdownEditor";
 import type { ViewerTarget } from "./KmsBrowserSidebar";
 
 /// M6.39.9: KMS viewer pane. Renders a KMS file as HTML inside the
@@ -35,8 +37,21 @@ interface Props {
 export function KmsViewerOverlay({ initial, onClose }: Props) {
   const [stack, setStack] = useState<ViewerTarget[]>([initial]);
   const [content, setContent] = useState<string | null>(null);
+  // Absolute dir of the current file, from `kms_file_content`. Used to
+  // resolve relative markdown image links to `/file-asset` URLs so KMS
+  // source images render here the same way they do in the Files tab.
+  const [assetBase, setAssetBase] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
+  // Edit mode (pages only): YAML frontmatter edited in a modal, the
+  // markdown body in a TipTap editor. `content` holds the original
+  // until a successful save re-fetches it.
+  const [editing, setEditing] = useState(false);
+  const [editYaml, setEditYaml] = useState("");
+  const [editBody, setEditBody] = useState("");
+  const [showFm, setShowFm] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
 
   const current = stack[stack.length - 1];
 
@@ -48,6 +63,9 @@ export function KmsViewerOverlay({ initial, onClose }: Props) {
     setStack([initial]);
     setContent(null);
     setError(null);
+    setEditing(false);
+    setShowFm(false);
+    setSaveError(null);
   }, [initial.kms, initial.kind, initial.name]);
 
   // Fetch content for the top-of-stack file.
@@ -63,6 +81,7 @@ export function KmsViewerOverlay({ initial, onClose }: Props) {
       ) {
         if (msg.ok) {
           setContent(msg.content as string);
+          setAssetBase(String(msg.asset_base ?? ""));
         } else {
           setError((msg.error as string) ?? "read failed");
         }
@@ -77,20 +96,74 @@ export function KmsViewerOverlay({ initial, onClose }: Props) {
     return unsub;
   }, [current.kms, current.kind, current.name]);
 
-  // ESC closes the overlay. Listener attaches on the document so it
-  // fires regardless of focus.
+  // ESC: close the frontmatter modal first, then exit edit mode
+  // (discarding unsaved edits), then close the overlay. Avoids an
+  // accidental overlay-close losing in-progress edits.
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key !== "Escape") return;
+      if (showFm) setShowFm(false);
+      else if (editing) setEditing(false);
+      else onClose();
     };
     document.addEventListener("keydown", handler);
     return () => document.removeEventListener("keydown", handler);
-  }, [onClose]);
+  }, [onClose, showFm, editing]);
+
+  // Save-result round-trip: on success, exit edit mode and re-fetch
+  // (the fetch effect's subscription is still mounted — deps unchanged
+  // during edit — so the re-sent kms_read_file refreshes `content`).
+  useEffect(() => {
+    if (!editing) return;
+    const unsub = subscribe((msg) => {
+      if (
+        msg.type === "kms_write_page_result" &&
+        msg.kms === current.kms &&
+        msg.name === current.name
+      ) {
+        setSaving(false);
+        if (msg.ok) {
+          setEditing(false);
+          setShowFm(false);
+          setContent(null);
+          send({
+            type: "kms_read_file",
+            kms: current.kms,
+            kind: current.kind,
+            name: current.name,
+          });
+        } else {
+          setSaveError((msg.error as string) ?? "save failed");
+        }
+      }
+    });
+    return unsub;
+  }, [editing, current.kms, current.kind, current.name]);
+
+  const startEdit = () => {
+    const { yaml, body } = splitFrontmatter(content ?? "");
+    setEditYaml(yaml);
+    setEditBody(body);
+    setSaveError(null);
+    setEditing(true);
+  };
+
+  const saveEdit = () => {
+    if (saving) return;
+    setSaving(true);
+    setSaveError(null);
+    send({
+      type: "kms_write_page",
+      kms: current.kms,
+      name: current.name,
+      content: recombineFrontmatter(editYaml, editBody),
+    });
+  };
 
   const html = useMemo(() => {
     if (content === null) return "";
-    return renderMarkdownToHtml(content);
-  }, [content]);
+    return rewriteImageSrcs(renderMarkdownToHtml(content), assetBase);
+  }, [content, assetBase]);
 
   // Intercept clicks on rendered anchors. Resolve KMS-internal
   // targets (wikilinks, relative paths) into back-stack pushes;
@@ -182,15 +255,75 @@ export function KmsViewerOverlay({ initial, onClose }: Props) {
             {current.name}
           </span>
         </div>
-        <button
-          type="button"
-          onClick={onClose}
-          className="p-1 rounded hover:bg-white/10"
-          style={{ color: "var(--text-secondary)" }}
-          title="Close (Esc) — return to active tab"
-        >
-          <X size={14} />
-        </button>
+        <div className="flex items-center gap-1 shrink-0">
+          {editing ? (
+            <>
+              <button
+                type="button"
+                onClick={() => setShowFm(true)}
+                className="px-2 py-1 rounded text-xs border hover:bg-white/10"
+                style={{
+                  color: "var(--text-secondary)",
+                  borderColor: "var(--border)",
+                }}
+                title="Edit YAML frontmatter"
+              >
+                Frontmatter
+              </button>
+              <button
+                type="button"
+                onClick={saveEdit}
+                disabled={saving}
+                className="flex items-center gap-1 px-2 py-1 rounded text-xs font-medium"
+                style={{
+                  background: "var(--accent)",
+                  color: "var(--accent-fg, #fff)",
+                  opacity: saving ? 0.6 : 1,
+                  cursor: saving ? "default" : "pointer",
+                }}
+                title="Save (writes the page)"
+              >
+                <Save size={12} />
+                {saving ? "Saving…" : "Save"}
+              </button>
+              <button
+                type="button"
+                onClick={() => setEditing(false)}
+                className="px-2 py-1 rounded text-xs border hover:bg-white/10"
+                style={{
+                  color: "var(--text-secondary)",
+                  borderColor: "var(--border)",
+                }}
+                title="Discard edits (Esc)"
+              >
+                Cancel
+              </button>
+            </>
+          ) : (
+            <>
+              {current.kind === "page" && content !== null && (
+                <button
+                  type="button"
+                  onClick={startEdit}
+                  className="p-1 rounded hover:bg-white/10"
+                  style={{ color: "var(--text-secondary)" }}
+                  title="Edit this page"
+                >
+                  <Pencil size={14} />
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={onClose}
+                className="p-1 rounded hover:bg-white/10"
+                style={{ color: "var(--text-secondary)" }}
+                title="Close (Esc) — return to active tab"
+              >
+                <X size={14} />
+              </button>
+            </>
+          )}
+        </div>
       </div>
 
       <div
@@ -198,7 +331,7 @@ export function KmsViewerOverlay({ initial, onClose }: Props) {
         className="flex-1 overflow-auto kms-viewer-prose"
         style={{ color: "var(--text-primary)" }}
       >
-        <div className="max-w-4xl mx-auto px-8 py-6">
+        <div className="max-w-4xl mx-auto px-4 sm:px-8 py-6">
           {error && (
             <div
               className="px-3 py-2 rounded"
@@ -219,11 +352,92 @@ export function KmsViewerOverlay({ initial, onClose }: Props) {
               <span>Loading…</span>
             </div>
           )}
-          {content !== null && (
+          {content !== null && !editing && (
             <div dangerouslySetInnerHTML={{ __html: html }} />
+          )}
+          {content !== null && editing && (
+            <>
+              {saveError && (
+                <div
+                  className="mb-3 px-3 py-2 rounded text-xs"
+                  style={{
+                    background: "var(--bg-secondary)",
+                    color: "var(--danger, #e06c75)",
+                  }}
+                >
+                  {saveError}
+                </div>
+              )}
+              <MarkdownEditor source={editBody} onChange={setEditBody} baseDir={assetBase} />
+            </>
           )}
         </div>
       </div>
+
+      {showFm && (
+        <div
+          className="fixed inset-0 z-[60] flex items-center justify-center"
+          style={{ background: "var(--modal-backdrop, rgba(0,0,0,0.55))" }}
+          onClick={() => setShowFm(false)}
+        >
+          <div
+            className="rounded-lg border shadow-xl w-[520px] max-w-[92vw] max-h-[90vh] flex flex-col"
+            style={{
+              background: "var(--bg-primary)",
+              borderColor: "var(--border)",
+              color: "var(--text-primary)",
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div
+              className="px-4 py-2 border-b text-sm font-semibold flex items-center gap-2"
+              style={{ borderColor: "var(--border)" }}
+            >
+              <span style={{ color: "var(--accent)" }}>●</span>
+              <span>YAML frontmatter · {current.name}</span>
+            </div>
+            <div className="px-4 py-3">
+              <textarea
+                value={editYaml}
+                onChange={(e) => setEditYaml(e.target.value)}
+                spellCheck={false}
+                rows={12}
+                className="w-full px-2 py-1.5 rounded border font-mono text-xs"
+                style={{
+                  background: "var(--bg-secondary)",
+                  borderColor: "var(--border)",
+                  color: "var(--text-primary)",
+                  resize: "vertical",
+                }}
+                placeholder={"title: My page\ntopic: one-line description\ncategory: notes\ntags: a, b"}
+              />
+              <div
+                className="mt-1.5 text-[10px]"
+                style={{ color: "var(--text-secondary)" }}
+              >
+                Edits apply when you Save the page. `created:` /
+                `updated:` are managed automatically.
+              </div>
+            </div>
+            <div
+              className="px-4 py-2.5 border-t flex justify-end"
+              style={{ borderColor: "var(--border)" }}
+            >
+              <button
+                type="button"
+                onClick={() => setShowFm(false)}
+                className="px-3 py-1.5 rounded text-xs font-medium"
+                style={{
+                  background: "var(--accent)",
+                  color: "var(--accent-fg, #fff)",
+                }}
+              >
+                Done
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -243,11 +457,55 @@ function renderMarkdownToHtml(markdown: string): string {
   return marked.parse(body) as string;
 }
 
+/// Rewrite relative `<img src>` in rendered KMS HTML to `/file-asset`
+/// URLs rooted at the file's directory (`assetBase`), so images ingested
+/// alongside a markdown source (`sources/<alias>-assets/…`) load in the
+/// viewer. Remote (`http(s):`/`data:`/`blob:`), already-absolute, and
+/// already-resolved (`thclaws:`) srcs are left alone. Runs on the
+/// rendered HTML only — the underlying `content` stays pristine so edit +
+/// save never persist these display URLs back into the source.
+function rewriteImageSrcs(html: string, assetBase: string): string {
+  if (!assetBase) return html;
+  const base = assetBase.replace(/\/+$/, "");
+  return html.replace(
+    /(<img\b[^>]*?\ssrc=)("|')(.*?)\2/gi,
+    (match, pre: string, quote: string, src: string) => {
+      const s = src.trim();
+      if (!s || /^(https?:|data:|blob:|thclaws:|\/\/)/i.test(s) || s.startsWith("/")) {
+        return match;
+      }
+      const rel = s.replace(/^\.\//, "");
+      return `${pre}${quote}${assetUrl(`${base}/${rel}`)}${quote}`;
+    },
+  );
+}
+
 function stripFrontmatter(s: string): string {
   if (!s.startsWith("---\n")) return s;
   const end = s.indexOf("\n---\n", 4);
   if (end < 0) return s;
   return s.slice(end + "\n---\n".length).trimStart();
+}
+
+/// Split raw page content into its YAML frontmatter (the text between
+/// the `---` fences, without them) and the markdown body. Pages with no
+/// frontmatter return an empty yaml + the whole string as body.
+function splitFrontmatter(raw: string): { yaml: string; body: string } {
+  if (!raw.startsWith("---\n")) return { yaml: "", body: raw };
+  const end = raw.indexOf("\n---\n", 4);
+  if (end < 0) return { yaml: "", body: raw };
+  const yaml = raw.slice(4, end);
+  const body = raw.slice(end + "\n---\n".length).replace(/^\n+/, "");
+  return { yaml, body };
+}
+
+/// Recombine edited YAML frontmatter + body back into page content for
+/// `write_page`. Empty/blank YAML → body only (write_page will stamp a
+/// minimal frontmatter). Always ends with a trailing newline.
+function recombineFrontmatter(yaml: string, body: string): string {
+  const y = yaml.trim();
+  const b = body.endsWith("\n") ? body : `${body}\n`;
+  return y ? `---\n${y}\n---\n\n${b}` : b;
 }
 
 function rewriteWikilinks(s: string): string {
@@ -283,7 +541,7 @@ function rewriteWikilinks(s: string): string {
 }
 
 function escapeMd(s: string): string {
-  return s.replace(/([\[\]])/g, "\\$1");
+  return s.replace(/([\\\[\]])/g, "\\$1");
 }
 
 /// Resolve a relative markdown link from the perspective of the

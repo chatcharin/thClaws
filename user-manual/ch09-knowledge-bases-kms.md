@@ -125,6 +125,76 @@ The conceptual model behind all of this:
 
 You can run all three via natural language. The slash commands are shortcuts.
 
+## Self-improving AI Agent (auto-learn)
+
+If you want the agent to **learn from itself** automatically — file
+every conversation into a KMS without ever running `/kms ingest` or
+`/kms reconcile` by hand — flip a single flag in
+`.thclaws/settings.json`:
+
+```json
+{
+  "autoLearn": true
+}
+```
+
+With this on:
+
+1. **At the end of every session** (clicking "new session" or closing
+   the GUI), thClaws summarises the conversation into a new page in a
+   KMS called `self_learn` (auto-created on first run; project scope).
+2. **On a schedule (default every 6 hours)**, after ingest, it runs
+   `/kms reconcile self_learn --apply` to resolve contradictions
+   across pages in that KMS.
+
+That's the whole thing — it's just the primitives from this chapter
+(`/kms ingest $`, `/kms reconcile`) wired into the session lifecycle.
+No new agents, no new prompts.
+
+### Why `self_learn` is a dedicated KMS
+
+Auto-learn never touches your hand-curated KMSes (`notes`,
+`client-api`, anything in `kms.active`). It writes only to
+`self_learn`. Three reasons:
+
+- **Noise control.** Not every session has an insight worth keeping.
+  Quarantining auto-ingest in its own KMS keeps your real vaults
+  clean.
+- **Easy reset.** Don't like what the agent learned? `rm -rf
+  .thclaws/kms/self_learn/` and start over. Your other vaults
+  unaffected.
+- **Reviewable separately.** `git diff .thclaws/kms/self_learn/`
+  shows only what the agent learned from itself; `git diff
+  .thclaws/kms/notes/` shows only what you curated by hand.
+
+### Settings
+
+| key | default | meaning |
+|---|---|---|
+| `autoLearn` | `false` | Master switch (opt-in) |
+| `autoLearnKms` | `"self_learn"` | Override the destination KMS name. Existing KMS by that name is reused; doesn't have to be empty. |
+| `autoLearnReconcileHours` | `6` | Minimum hours between reconcile passes (set `0` to reconcile every session) |
+
+### Quality gate
+
+Sessions shorter than **5 messages** are skipped — opening and
+closing the app doesn't trigger ingest. Every decision lands in a
+log at `~/.config/thclaws/auto-learn.log`:
+
+```
+2026-05-20T08:15:00Z ingest ok: session=sess-abc123 kms=self_learn page=auth-jwt-design
+2026-05-20T08:15:42Z reconcile ok: kms=self_learn (next due in 6h)
+2026-05-20T09:02:11Z skip ingest: session sess-def456 only had 3 messages (threshold 5)
+```
+
+### Where auto-learn runs
+
+As of v0.13.0, the auto-trigger fires from the **Desktop GUI** and
+the **Webapp** (`--serve` + browser) — both run the same worker that
+manages session lifecycle. CLI REPL and print mode (`-p`) don't yet
+auto-trigger; wire it via the `session_end` shell hook
+([Chapter 13](ch13-hooks.md)) until they do.
+
 ## Multi-KMS: attach any subset to a chat
 
 A project's active KMS list lives in `.thclaws/settings.json`:
@@ -157,6 +227,17 @@ To grep all pages, call `KmsSearch(kms: "notes", pattern: "...")`.
 
 And `KmsRead` / `KmsSearch` (and the mutating `KmsWrite` / `KmsAppend` / `KmsDelete`) are registered in the tool list. **Several slash commands below require at least one KMS to be active** — without it, KMS tools aren't in the registry and the agent can't act on any KMS by name.
 
+### Automatic retrieval (you don't have to say "from the KMS")
+
+The index above tells the agent *what exists*, but relying on the model to **decide** to look it up is unreliable — for a casual or "tell me about X" phrasing, models (even strong ones) often answer from training data and skip the KMS. So thClaws also does **deterministic pre-retrieval**: on every message, the engine itself searches your active KMS for the message's keywords and, when there's a strong match, injects a short pointer list of the matching **topic pages** right into that turn — e.g.:
+
+```
+## Relevant KMS pages (auto-matched to this message)
+- `KMS: notes/auth-flow` — JWT refresh pattern we use
+```
+
+The agent then reads those pages and answers from them (citing `KMS: <name>/<page>`), instead of re-deriving the answer or doing a fresh web search. It's gated by relevance, so greetings, coding turns, and off-topic asks pull nothing; provenance/audit pages (session digests, dream logs) are skipped in favour of canonical topic pages. The net effect: ask "tell me about Corgis" and you get *your* curated page back — no need to add "from the KMS". (Requires the BM25 search index, which the released binaries include; `cargo install` users opt in with `--features kms_search_index`.)
+
 ## Slash commands
 
 The full surface, grouped by purpose:
@@ -164,8 +245,14 @@ The full surface, grouped by purpose:
 - **Discovery and inspection**: `/kms`, `/kms show`
 - **Lifecycle**: `/kms new`, `/kms use`, `/kms off`
 - **Capture**: `/kms ingest`, `/kms dump`, `/kms file-answer`
-- **Maintenance**: `/kms lint`, `/kms wrap-up`, `/kms reconcile`, `/kms migrate`
+- **Maintenance**: `/kms lint`, `/kms wrap-up`, `/kms reconcile`, `/kms maintain` (all four in one pass), `/kms migrate`
+- **Cross-linking**: `/kms link`
+- **Consolidation**: `/kms merge`
 - **Decision support**: `/kms challenge`
+- **Interchange**: `/kms export-okf`, `/kms import-okf`
+- **Destruction**: `/kms drop`
+
+Most subcommands accept short aliases (e.g. `add` for `ingest`, `rm` for `drop`) — the aliases are listed inline under each section heading below.
 
 ### `/kms` (or `/kms list`)
 
@@ -182,7 +269,7 @@ List every discoverable KMS; `*` marks ones attached to the current project.
 
 ### `/kms show NAME`
 
-Print the KMS's `index.md` to inspect what's there.
+Print the KMS's `index.md` to inspect what's there. Aliases: `cat`.
 
 ```
 ❯ /kms show notes
@@ -194,7 +281,7 @@ Print the KMS's `index.md` to inspect what's there.
 
 ### `/kms new [--project] NAME`
 
-Create a new KMS and seed starter files (including `manifest.json`).
+Create a new KMS and seed starter files (including `manifest.json`). Aliases: `create`.
 
 ```
 ❯ /kms new meeting-notes
@@ -209,7 +296,7 @@ created KMS 'design-decisions' (project) → ./.thclaws/kms/design-decisions
 
 ### `/kms use NAME`
 
-Attach a KMS to the current project. The `KmsRead` / `KmsSearch` / `KmsWrite` / `KmsAppend` / `KmsDelete` tools are registered into the current session immediately and the `index.md` is spliced into the system prompt — no restart, works in the CLI REPL and either GUI tab.
+Attach a KMS to the current project. The `KmsRead` / `KmsSearch` / `KmsWrite` / `KmsAppend` / `KmsDelete` tools are registered into the current session immediately and the `index.md` is spliced into the system prompt — no restart, works in the CLI REPL and either GUI tab. Aliases: `on`.
 
 ```
 ❯ /kms use notes
@@ -218,7 +305,7 @@ KMS 'notes' attached (tools registered; available this turn)
 
 ### `/kms off NAME`
 
-Detach a KMS. Also live — when the last KMS detaches, the KMS tools are dropped from the registry so the model stops seeing them as options.
+Detach a KMS. Also live — when the last KMS detaches, the KMS tools are dropped from the registry so the model stops seeing them as options. Aliases: `unuse`.
 
 ```
 ❯ /kms off archived-docs
@@ -227,7 +314,7 @@ KMS 'archived-docs' detached (system prompt updated)
 
 ### `/kms ingest NAME <file-or-url-or-$>`
 
-Add a source. Auto-detects the source type and routes to the right ingest path. Two-step split: raw bytes go to `sources/<alias>.<ext>` (immutable), a stub page lands in `pages/<alias>.md` with frontmatter pointing back at the source. You then enrich the stub via natural prompting or another `/kms ingest --force`.
+Add a source. Auto-detects the source type and routes to the right ingest path. Aliases: `add`. Two-step split: raw bytes go to `sources/<alias>.<ext>` (immutable), a stub page lands in `pages/<alias>.md` with frontmatter pointing back at the source. You then enrich the stub via natural prompting or another `/kms ingest --force`.
 
 | Source pattern | Behaviour |
 |---|---|
@@ -272,7 +359,7 @@ Use `--force` to replace if the resolved page already exists.
 
 ### `/kms dump NAME <text>`
 
-Capture freeform content and route it. The agent classifies the dump into chunks (one decision, one observation, one new source per chunk), announces its routing plan in plain text, then executes via `KmsWrite` / `KmsAppend`.
+Capture freeform content and route it. The agent classifies the dump into chunks (one decision, one observation, one new source per chunk), announces its routing plan in plain text, then executes via `KmsWrite` / `KmsAppend`. Aliases: `capture`.
 
 > Requires KMS tools — run `/kms use <name>` first if no KMS is attached. Without it the command refuses with a clear error.
 
@@ -333,7 +420,7 @@ missing required frontmatter fields (1):
 
 ### `/kms wrap-up NAME [--fix]`
 
-Session-end review. Combines lint with a scan for stale-marker pages — pages flagged by the re-ingest cascade (`> ⚠ STALE: source <alias> was re-ingested on YYYY-MM-DD`) that are awaiting a refresh against the new source content.
+Session-end review. Combines lint with a scan for stale-marker pages — pages flagged by the re-ingest cascade (`> ⚠ STALE: source <alias> was re-ingested on YYYY-MM-DD`) that are awaiting a refresh against the new source content. Aliases: `wrapup`, `wrap`.
 
 ```
 ❯ /kms wrap-up notes
@@ -354,7 +441,7 @@ next steps: ask the agent to refresh stale pages and fix lint issues, or run `/k
 
 ### `/kms reconcile NAME [<focus>] [--apply]`
 
-Auto-resolve contradictions. Dispatches the built-in **`kms-reconcile`** subagent which runs four passes (claims / entities / decisions / source-freshness), classifies each finding (clear-winner / ambiguous / evolution), and either rewrites the outdated page with a `## History` section or creates a `Conflict — <topic>.md` page for genuinely-ambiguous cases. Dry-run by default; `--apply` executes writes. Optional second positional arg narrows the pass to a specific topic. GUI-only.
+Auto-resolve contradictions. Dispatches the built-in **`kms-reconcile`** subagent which runs four passes (claims / entities / decisions / source-freshness), classifies each finding (clear-winner / ambiguous / evolution), and either rewrites the outdated page with a `## History` section or creates a `Conflict — <topic>.md` page for genuinely-ambiguous cases. Dry-run by default; `--apply` executes writes. Optional second positional arg narrows the pass to a specific topic. GUI-only. Aliases: `resolve`.
 
 > Requires KMS tools — run `/kms use <name>` first if no KMS is attached.
 
@@ -382,9 +469,37 @@ this was a dry-run preview. re-run with `--apply` to execute.
 
 `kms-reconcile`'s tool whitelist is **strictly narrower than `dream`** — `KmsRead, KmsSearch, KmsWrite, KmsAppend, TodoWrite` only. No `KmsDelete` (reconcile preserves every original claim, either in `## History` on the rewritten page or in the Conflict page). Hard rules: never invent dates or sources; "someone changed their mind" classifies as Evolution, not contradiction.
 
+### `/kms maintain NAME [--apply]`
+
+The **one-command maintenance umbrella**. Instead of running `lint`, `wrap-up --fix`, and `reconcile` separately, `/kms maintain` dispatches the built-in **`kms-maintain`** subagent to run them as a single staged pipeline — plus a step the others can't do (reconciling provenance against your live sessions). Dry-run by default; `--apply` executes. GUI-only. Aliases: `tidy`.
+
+The five stages, run in order (cheap mechanical cleanup first, judgment-heavy work last):
+
+1. **Structural fixes** — broken page links, pages missing from the index, missing required frontmatter (the `lint` + `kms-linker` job).
+2. **Source reconciliation** — globs your live `.thclaws/sessions/`, and for any page whose `sources:` lists a `sess-…` whose session you've since **deleted**, drops just that dead id from `sources:`. **Pages are never deleted** — knowledge built from a session outlives the session; only the dangling pointer goes. (This is the full-vault version of the cleanup `/dream` does incrementally.)
+3. **Stale refresh** — refreshes pages flagged `> ⚠ STALE` by the re-ingest cascade.
+4. **Contradiction reconciliation** — the full `reconcile` pass (claims / entities / decisions / source-freshness) across the whole vault, with `## History` rewrites and `Conflict —` pages.
+5. **Orphans** — listed for your review, never modified.
+
+```
+❯ /kms maintain notes
+✓ kms-maintain dispatched (id: side-9f3c, dry-run)
+
+[subagent reports back, sections in stage order]
+DRY-RUN — no changes written. Re-run with --apply to execute.
+**Structural fixed (1):** - oauth-flow: relinked to sso-config
+**Sources reconciled (2):** - corgi: dropped dead sess-… (session deleted)
+**Contradictions auto-resolved (1):** - redis-config: cites 2026 spec
+**Orphans (3, untouched):** - …
+```
+
+Like `reconcile`, the `kms-maintain` agent has **no `KmsDelete`** — it never deletes a page, the most it removes is a dead reference inside one. It does have `Glob` (needed to read the live session set in stage 2). Requires KMS tools — run `/kms use <name>` first.
+
+**`/kms maintain` vs `/dream`** — complementary. `/dream` is *incremental*: it mines new sessions and cleans only the pages it touches. `/kms maintain` is a *full-vault* sweep over every page, regardless of recent activity — run it occasionally (or before a commit) to tidy the whole KMS at once.
+
 ### `/kms migrate NAME [--apply]`
 
-Schema migration. Defaults to dry-run (prints the plan without writing); pass `--apply` to execute. Idempotent — running on a KMS already at the latest version reports `already at schema version X — nothing to migrate`.
+Schema migration. Defaults to dry-run (prints the plan without writing); pass `--apply` to execute. Idempotent — running on a KMS already at the latest version reports `already at schema version X — nothing to migrate`. Aliases: `upgrade`.
 
 ```
 ❯ /kms migrate legacy-notes
@@ -436,6 +551,84 @@ point to the same risk. Recommend at minimum a manual smoke pass before merge.
 
 The agent's prompt explicitly tells it "don't be agreeable" — push back when the vault gives ammunition. The output is a written analysis, not vault writes; nothing is filed.
 
+### `/kms link [<name>] [--apply] [--llm] [--min-len N]`
+
+Auto-insert `[[wiki-style]]` cross-links across pages in a KMS. Without a name, it iterates every KMS in `kms_active` for this session. Aliases: `autolink`, `cross-link`.
+
+**Deterministic by default** — scans each page's `## Goal` / `## Links` headings and the body for occurrences of other page stems (case-insensitive, word-boundary aware) and rewrites them as `[[page-stem]]`. `--min-len N` (default `4`) suppresses links shorter than N characters so noise like `[[api]]` doesn't carpet every page.
+
+**`--llm` switches to a per-page LLM pass** — sends each page through the current model with the KMS index as context and asks it to surface non-obvious cross-link opportunities. Slower (one provider call per page) but catches semantic matches the deterministic pass misses ("session" ↔ "conversation", "token" ↔ "API key", etc.).
+
+**Dry-run is the default.** Pass `--apply` to actually write the changes.
+
+```
+❯ /kms link notes
+/kms link notes (deterministic, dry-run): scanned 23 page(s), 8 would gain link(s), 19 link insertion(s) total.
+    oauth-flow: "session" → [[session-management]]
+    oauth-flow: "refresh token" → [[token-refresh]]
+    incident-2026-01-12: "auth flow" → [[oauth-flow]]
+    …
+  re-run with --apply to write the changes.
+
+❯ /kms link notes --apply
+/kms link notes (deterministic, applied): scanned 23 page(s), 8 modified, 19 link insertion(s) total.
+```
+
+Use it after `/kms ingest` runs to weave new pages into the existing graph, or after `/kms merge` once the combined set settles.
+
+### `/kms merge <src> <dst>`
+
+Consolidate two KMSes — copy every page, source, and index entry from `src` into `dst`, with collision handling. Aliases: `combine`.
+
+- **Page name collision** → the incoming page is renamed `<stem>-1.md` (or `-2`, `-3`, …) so the destination's original wins.
+- **Aggregator pages** (those tagged `aggregator: true` in frontmatter, e.g. `architecture.md`) get **combined** instead of renamed — the src body is appended under the dst body so consolidated overview pages don't fragment.
+- **Source files** in `sources/` follow the same rename-on-collision rule.
+- **Index entries** in `dst/index.md` get appended for every new page.
+
+`src` is **left intact** — merge is non-destructive on the source side so you can verify before cleaning up.
+
+```
+❯ /kms merge old-notes new-notes
+merged 'old-notes' → 'new-notes': 47 page(s) copied (3 renamed, 2 combined), 14 source(s) copied (1 renamed), 47 index entr(ies) added.
+  aggregator pages combined (src body appended under dst body):
+    architecture.md
+    decisions.md
+  collision renames (kept original on dst, incoming was renamed):
+    page: oauth-flow.md → oauth-flow-1.md
+    page: session-id.md → session-id-1.md
+    page: README.md → README-1.md
+    source: spec.pdf → spec-1.pdf
+  'old-notes' is left intact; run `/kms drop old-notes` once you've verified.
+
+suggested workflow now:
+  /kms wrap-up new-notes --fix       # fix broken links + STALE markers
+  /kms link new-notes                # dry-run preview of auto-links
+  /kms link new-notes --apply        # write the wikilinks
+  /kms reconcile new-notes --apply   # resolve contradictions across pages
+  /kms drop old-notes --force        # remove the source KMS once happy
+```
+
+The output suggests the natural cleanup sequence — `wrap-up --fix` patches broken links from the rename pass, `link --apply` weaves new pages into the graph, `reconcile --apply` resolves contradictions where two KMSes covered the same topic differently, then `drop --force` retires the source KMS.
+
+### `/kms drop NAME [--force]`
+
+Destructive — removes the entire KMS directory tree (`<scope>/.thclaws/kms/<name>/` or `~/.config/thclaws/kms/<name>/`). Aliases: `delete`, `rm`.
+
+**Dry-run is the default.** Without `--force` it prints how many pages and sources *would* be removed but doesn't touch disk:
+
+```
+❯ /kms drop archived-notes
+/kms drop archived-notes: dry-run (would remove 12 page(s), 3 source(s) from /Users/you/.config/thclaws/kms/archived-notes).
+  re-run with --force to delete.
+
+❯ /kms drop archived-notes --force
+deleted KMS 'archived-notes' (12 page(s), 3 source(s)) from /Users/you/.config/thclaws/kms/archived-notes.
+```
+
+`--force` also detaches the KMS from this session's `kms_active` list (otherwise the next system-prompt rebuild would fail trying to resolve a dangling name). The GUI sidebar refreshes immediately so the dropped KMS disappears from the Knowledge section.
+
+No undo — the directory is gone after `--force`. If the KMS is in git (project-scope, committed), recover via `git checkout`; otherwise it's gone. Pair with `/kms merge` first when consolidating to keep a copy in the destination KMS before dropping the source.
+
 ## Schema versioning and frontmatter rules
 
 `manifest.json` is the KMS's machine-readable schema. New KMSes get one automatically:
@@ -473,11 +666,62 @@ Pages without any frontmatter at all are flagged separately under `pages without
 
 Legacy KMSes (created before manifests existed) have no `manifest.json` and silently skip the per-field check. Run `/kms migrate <name> --apply` to bring them to v1.0; the migration is purely additive (writes the manifest file, doesn't touch pages).
 
+## Importing and exporting OKF bundles
+
+A KMS can be shipped to — and created from — an **Open Knowledge Format (OKF)** bundle. OKF is Google's open v0.1 spec for representing knowledge as a folder of markdown files with YAML frontmatter — the same "LLM wiki" shape a KMS already uses. Because the formats are so close, this is a clean round-trip: export a KMS as a vendor-neutral bundle you can zip up, commit to git, or hand to another team's agent; and import any OKF bundle (yours or someone else's) as a new KMS.
+
+Nothing about how your KMS works on disk changes — this is a converter, not a new storage format. The agent still reads your KMS exactly as before.
+
+### Export — `/kms export-okf NAME [OUT-DIR]`
+
+Writes the KMS as an OKF bundle. Without an output directory it lands in `./NAME-okf/` in your working directory:
+
+```
+❯ /kms export-okf notes
+exported 'notes' as OKF bundle → /Users/you/work/notes-okf (42 page(s), 7 reference(s)).
+```
+
+The bundle is a plain folder you can browse, diff, or archive:
+
+```
+notes-okf/
+├── index.md          # table of contents (declares okf_version)
+├── log.md            # change history
+├── SCHEMA.md         # your page conventions
+├── pages/            # one markdown file per page (your "concepts")
+└── references/       # your raw sources
+```
+
+During export the frontmatter is normalised to OKF's vocabulary — your `category:` becomes OKF's required `type:`, `topic:` becomes `description:`, comma-separated `tags` become a YAML list — and `[[wikilinks]]` become ordinary markdown links so any OKF reader can follow them. Your KMS-specific fields (`sources`, `verified`, `created`) are preserved as-is, so a round-trip loses nothing.
+
+### Import — `/kms import-okf BUNDLE-DIR NAME [--project]`
+
+Creates a **new** KMS named `NAME` from a bundle on disk. Defaults to user scope; add `--project` to create it under `./.thclaws/kms/` instead:
+
+```
+❯ /kms import-okf ./partner-bundle partner-knowledge
+imported OKF bundle './partner-bundle' → KMS 'partner-knowledge' (user scope): 30 page(s), 4 source(s).
+  attach it with `/kms use partner-knowledge`.
+```
+
+Import is forgiving by design (per the OKF spec): unknown field values, missing fields, and broken cross-links are all tolerated rather than rejected. Concepts that live anywhere in the bundle — not just under `pages/` — are pulled in, and the table of contents is rebuilt fresh so the result behaves like any other KMS. Import refuses if a KMS by that name already exists at the chosen scope; drop it or pick another name.
+
+### From the sidebar (GUI)
+
+You don't need the commands in the desktop app — **right-click the "Knowledge" section header** in the sidebar:
+
+- **Import OKF bundle…** asks for the new KMS name and scope, then opens a native folder picker for the bundle directory.
+- **Export OKF bundle** lists your KMSes; pick one and choose a destination folder.
+
+A short status line under the header confirms the result, and an import makes the new KMS appear immediately with its attach checkbox. (These menu actions are desktop-only because they open a native folder dialog; over `--serve`/remote use the slash commands.)
+
 ## Sidebar (GUI)
 
 The sidebar's **Knowledge** section lists every discoverable KMS with a checkbox per entry. Tick to attach, untick to detach — the same underlying toggle as `/kms use` / `/kms off`.
 
 The `+` button prompts for a name, then asks for scope (OK = user, Cancel = project). A new KMS is created with starter files ready to edit.
+
+**Right-click the "Knowledge" header** for OKF import/export (see [Importing and exporting OKF bundles](#importing-and-exporting-okf-bundles) above).
 
 ## Tools the agent calls
 
@@ -493,9 +737,9 @@ The agent calls this after spotting a relevant entry in `index.md`:
 [result] (page content)
 ```
 
-### `KmsSearch(kms: "name", pattern: "regex")`
+### `KmsSearch(kms: "name", pattern: "regex")` — line grep (default)
 
-Grep-style scan across `<kms_root>/pages/*.md`. Returns matching lines as `page:line:text`, one per line.
+Grep-style scan across `<kms_root>/pages/*.md`. Returns matching lines as `page:line:text`, one per line. Use for exact-shape lookups (find a specific TODO marker, function name, error code).
 
 ```
 [assistant] Let me search for "bearer" across my notes…
@@ -503,6 +747,76 @@ Grep-style scan across `<kms_root>/pages/*.md`. Returns matching lines as `page:
 [result]
 auth-flow:12:Bearer tokens expire after 15 minutes
 api-conventions:34:Always include "Authorization: Bearer <token>"
+```
+
+### `KmsSearch(kms: "name", query: "...")` — BM25-ranked search
+
+Native-language search across page title (×4 boost), topic (×2), and body. Returns ranked hits with snippet previews. Use when you don't know the exact phrasing and want the most relevant pages, not every line that matches.
+
+```
+[assistant] Let me find pages about refresh tokens…
+[tool: KmsSearch(kms: "notes", query: "token refresh flow")]
+[result]
+[score 6.12] page: auth-flow
+  title: Refresh-token rotation
+  topic: auth
+  preview: The token refresh rotates on every login. Refresh tokens are stored…
+
+[score 4.88] page: bug-2023-03
+  preview: Rotation logic in __refresh_token__ misfired when the session…
+```
+
+Optional filters narrow the candidate set without affecting score ranking:
+
+- `tags: ["auth", "security"]` — match pages tagged with ANY of these (OR semantics; uses frontmatter `tags:`).
+- `category: "runbook"` — exact match on the page's frontmatter `category:`.
+- `limit: 20` — max hits (default 10, capped at 50).
+
+**Build prerequisite.** `query:` mode requires the `kms_search_index` Cargo feature, which adds ~4-5 MB to the binary (tantivy + a Thai-aware dictionary). The official release binaries on github.com/thClaws/thClaws/releases ship with it ON; users who `cargo install` need `cargo install thclaws-core --features kms_search_index`. Without the feature, `query:` returns a clear error directing you to `pattern:`. The regex `pattern:` path always works.
+
+**First-touch indexing.** The first `query:` call against a KMS that doesn't have an index yet builds one synchronously from `pages/` on disk and emits a one-line `[index rebuilt — N page(s) indexed]` advisory. Subsequent queries hit the warm index (sub-50 ms on a 1000-page KMS). Bulk operations that don't fire per-page index hooks — `/kms merge`, `/kms link --apply` — trigger the same rebuild on the next query, or you can force one with `/kms reindex <name>`.
+
+**Thai-aware tokenization.** The BM25 path uses a native Rust port of PyThaiNLP's `newmm` segmenter so Thai content indexes word-by-word, not as one paragraph-sized token. Search works equally well on `query: "token refresh"` and `query: "การรีเฟรช token"`. Per-project supplements via `<kms_root>/extra_words_th.txt` let you add domain-specific terms the base dict misses.
+
+### `/kms search <name|*> <query>` — one-shot operator search
+
+Same surface as the `KmsSearch` tool, exposed as a slash command so you can search without a model round-trip (saves tokens + latency for exploratory lookups, and confirms the index works after `/kms reindex`).
+
+```
+> /kms search notes token refresh
+[score 6.12] page: auth-flow
+  title: Refresh-token rotation
+  preview: The token refresh rotates on every login…
+```
+
+Use `*` for `<name>` to fan out across every visible KMS — results are grouped under a per-KMS header so attribution stays clear:
+
+```
+> /kms search * bearer
+── KMS: notes ──
+[score 5.41] page: auth-flow
+  preview: Bearer tokens expire after 15 minutes…
+
+── KMS: project ──
+(no hits)
+```
+
+Default mode is BM25 `query:`. Switch to the regex line-grep with `--pattern`:
+
+```
+> /kms search notes --pattern ^TODO
+todos:3:TODO: rotate the staging cert
+api:18:TODO: deprecate /v1
+```
+
+### `/kms reindex <name>` — manual rebuild
+
+Drops `<kms_root>/.index/` and rebuilds from `pages/` on disk. Operator-only (no `KmsReindex` tool — the model doesn't decide to rebuild mid-turn). Useful after bulk operations the index didn't see, or if the index file ever corrupts.
+
+```
+> /kms reindex notes
+/kms reindex notes — rebuilding…
+/kms reindex notes — indexed 247 page(s)
 ```
 
 ### `KmsWrite`, `KmsAppend`, `KmsDelete`, `KmsCreate`
@@ -673,7 +987,7 @@ The browser sidebar has a "Graph View" button above the page list. Clicking it r
 
 ### `/kms html NAME [OUT]` — single-file interactive site
 
-Generates a self-contained HTML site from a KMS's pages and writes it to your workspace (default `./<NAME>-site/index.html`). Unlike the in-app viewer, this is a **derived artifact** you can share, commit to git, host on S3, or hand to colleagues — it has no thClaws dependency.
+Generates a self-contained HTML site from a KMS's pages and writes it to your workspace (default `./<NAME>-site/index.html`). Unlike the in-app viewer, this is a **derived artifact** you can share, commit to git, host on S3, or hand to colleagues — it has no thClaws dependency. Aliases: `site`, `export`.
 
 The agent runs a three-phase workflow:
 

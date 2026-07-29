@@ -18,6 +18,8 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use reqwest::Client;
 use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::sync::OnceLock;
 
 pub const DEFAULT_API_URL: &str = "https://opencode.ai/zen/go/v1";
 pub const MODELS_URL: &str = "https://opencode.ai/zen/go/v1/models";
@@ -28,9 +30,13 @@ pub const MODELS_URL: &str = "https://opencode.ai/zen/go/v1/models";
 // qwen4.x release doesn't silently fall through to the OpenAI path
 // and get rejected with a 4xx upstream. Tracked as a TODO so we can
 // rip out the lists once the upstream exposes the hint.
-const ANTHROPIC_MODELS: &[&str] = &["minimax-m2.5", "minimax-m2.7"];
-const ALIBABA_MODELS: &[&str] = &["qwen3.5-plus", "qwen3.6-plus"];
-const REASONING_MODELS: &[&str] = &["deepseek-v4-pro", "deepseek-v4-flash"];
+const ANTHROPIC_MODELS: &[&str] = &["minimax-m2.5", "minimax-m2.7", "minimax-m3"];
+const ALIBABA_MODELS: &[&str] = &[
+    "qwen3.5-plus",
+    "qwen3.6-plus",
+    "qwen3.7-max",
+    "qwen3.7-plus",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WireFormat {
@@ -60,6 +66,14 @@ fn detect_wire_format(model: &str) -> WireFormat {
     }
 }
 
+fn detect_wire_format_with_hints(model: &str, hints: &HashMap<String, WireFormat>) -> WireFormat {
+    let lower = model.to_lowercase();
+    if let Some(&fmt) = hints.get(&lower) {
+        return fmt;
+    }
+    detect_wire_format(model)
+}
+
 fn endpoint_for(format: WireFormat) -> &'static str {
     match format {
         WireFormat::OpenAI => "/chat/completions",
@@ -68,16 +82,12 @@ fn endpoint_for(format: WireFormat) -> &'static str {
     }
 }
 
-fn model_uses_reasoning_content(model: &str) -> bool {
-    let lower = model.to_lowercase();
-    REASONING_MODELS.iter().any(|p| lower.contains(p))
-}
-
 pub struct OpencodeGoProvider {
     client: Client,
     api_key: String,
     base_url: String,
     list_models_url: Option<String>,
+    wire_cache: OnceLock<HashMap<String, WireFormat>>,
 }
 
 impl OpencodeGoProvider {
@@ -87,22 +97,24 @@ impl OpencodeGoProvider {
             api_key: api_key.into(),
             base_url: DEFAULT_API_URL.to_string(),
             list_models_url: None,
+            wire_cache: OnceLock::new(),
         }
     }
 
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
         self.base_url = url.into();
+        self.wire_cache = OnceLock::new();
         self
     }
 
     pub fn with_list_models_url(mut self, url: impl Into<String>) -> Self {
         self.list_models_url = Some(url.into());
+        self.wire_cache = OnceLock::new();
         self
     }
 
     fn messages_to_openai(req: &StreamRequest) -> Vec<Value> {
         let mut out: Vec<Value> = Vec::new();
-        let echo_reasoning = model_uses_reasoning_content(&req.model);
 
         if let Some(sys) = &req.system {
             if !sys.is_empty() {
@@ -128,9 +140,7 @@ impl OpencodeGoProvider {
                 match block {
                     ContentBlock::Text { text } => text_parts.push(text.clone()),
                     ContentBlock::Thinking { content, .. } => {
-                        if echo_reasoning {
-                            thinking_parts.push(content.clone());
-                        }
+                        thinking_parts.push(content.clone());
                     }
                     ContentBlock::Image {
                         source: ImageSource::Base64 { media_type, data },
@@ -242,33 +252,287 @@ impl OpencodeGoProvider {
             "stream_options": {"include_usage": true},
         });
         if !req.tools.is_empty() {
-            body["tools"] = json!(req.tools.iter().map(|t| json!({
-                "type": "function",
-                "function": { "name": t.name, "description": t.description, "parameters": t.input_schema }
-            })).collect::<Vec<_>>());
+            let tools: Vec<Value> = req
+                .tools
+                .iter()
+                .map(|t| {
+                    json!({
+                        "type": "function",
+                        "function": {
+                            "name": t.name,
+                            "description": t.description,
+                            "parameters": t.input_schema,
+                        }
+                    })
+                })
+                .collect();
+            body["tools"] = json!(tools);
+        }
+        body
+    }
+
+    fn messages_to_alibaba(req: &StreamRequest, with_cache: bool) -> Vec<Value> {
+        let mut msgs = Self::messages_to_openai(req);
+        if !with_cache {
+            return msgs;
+        }
+        // Per Alibaba docs (https://help.aliyun.com/zh/model-studio/context-cache),
+        // explicit cache markers use `"cache_control": {"type": "ephemeral"}`
+        // on content blocks within messages. Markers are added to:
+        //
+        //   1. The system message (stable prefix across turns)
+        //   2. The current user message (cache endpoint: the most recent user
+        //      input, from which the server back-tracks up to 20 content blocks
+        //      to find a match against any pre-existing cache block)
+        //
+        // Max 4 markers allowed; we use 2 conservatively.
+        // When content is a plain string it's converted to a content-block
+        // array so the `cache_control` field can be attached.
+        //
+        // Cache is created lazily (after response, on first request).
+        // TTL: 5 minutes (reset on hit).
+
+        // 1. System message
+        for msg in &mut msgs {
+            if msg.get("role") == Some(&json!("system")) {
+                if let Some(content) = msg.get_mut("content") {
+                    match content.as_str() {
+                        Some(text) if !text.is_empty() => {
+                            *content = json!([{
+                                "type": "text",
+                                "text": text,
+                                "cache_control": {"type": "ephemeral"}
+                            }]);
+                        }
+                        _ => {}
+                    }
+                }
+                break;
+            }
+        }
+
+        // 2. Current user message (the most recent user input).
+        // The cache_control marker tells the server to back-track from
+        // this position to find a matching cache block. The loop iterates
+        // in reverse order starting from the last message — we want the
+        // *current* (most recent) user message, not a past one. We skip
+        // tool-result messages (which lack text content).
+        for msg in msgs.iter_mut().rev() {
+            if msg.get("role") != Some(&json!("user")) {
+                continue;
+            }
+            // Skip messages that are purely tool-call result follow-ups
+            // (they contain image references or tool_call_id).
+            if msg.get("tool_call_id").is_some() {
+                continue;
+            }
+            let content = match msg.get_mut("content") {
+                Some(c) => c,
+                _ => continue,
+            };
+            match content {
+                Value::String(text) if !text.is_empty() => {
+                    *content = json!([{
+                        "type": "text",
+                        "text": text,
+                        "cache_control": {"type": "ephemeral"}
+                    }]);
+                    break;
+                }
+                Value::Array(arr) => {
+                    // Already a content-block array (e.g. with images).
+                    // Add cache_control to the first text block.
+                    let mut found = false;
+                    for block in arr.iter_mut() {
+                        if block.get("type") == Some(&json!("text"))
+                            && block
+                                .get("text")
+                                .and_then(Value::as_str)
+                                .is_some_and(|s| !s.is_empty())
+                        {
+                            if let Some(obj) = block.as_object_mut() {
+                                obj.insert("cache_control".into(), json!({"type": "ephemeral"}));
+                            }
+                            found = true;
+                            break;
+                        }
+                    }
+                    if found {
+                        break;
+                    }
+                    // No text block found; fall through to continue below.
+                }
+                _ => {}
+            }
+            // Only the last eligible user message gets a marker;
+            // if current message had no suitable text, keep looking
+            // at earlier messages.
+            continue;
+        }
+
+        msgs
+    }
+
+    fn build_alibaba_body(req: &StreamRequest) -> Value {
+        Self::build_alibaba_body_inner(req, true)
+    }
+
+    fn build_alibaba_body_no_cache(req: &StreamRequest) -> Value {
+        Self::build_alibaba_body_inner(req, false)
+    }
+
+    fn build_alibaba_body_inner(req: &StreamRequest, with_cache: bool) -> Value {
+        // DashScope / Alibaba uses the OpenAI-compatible `/chat/completions`
+        // format but expects `max_tokens` (pre-o-series field name) rather
+        // than `max_completion_tokens`.
+        //
+        // # Prompt caching — Alibaba (Qwen)
+        // Source: https://help.aliyun.com/zh/model-studio/context-cache
+        //
+        // Two modes, mutually exclusive per request:
+        //
+        // | Mode | Activation | Request fields | Billing |
+        // |---|---|---|---|
+        // | Implicit (隐式缓存) | Automatic, always on, can't disable | None | Hit: 20% of input rate |
+        // | Explicit (显式缓存) | Opt-in via cache_control markers on messages | `cache_control: {type: "ephemeral"}` on content blocks | Create: 125%, Hit: 10% |
+        //
+        // When `with_cache=true`, cache_control markers are placed on:
+        //   - System message (stable prefix)
+        //   - Last user message with text content (rolling history)
+        //
+        // If the server rejects explicit cache (400), the caller retries
+        // with `build_alibaba_body_no_cache` which sends implicit-mode
+        // requests (no markers).
+        let messages = Self::messages_to_alibaba(req, with_cache);
+        let mut body = json!({
+            "model": req.model,
+            "max_tokens": req.max_tokens,
+            "messages": messages,
+            "stream": true,
+            "stream_options": {"include_usage": true},
+        });
+        if !req.tools.is_empty() {
+            let tools: Vec<Value> = req
+                .tools
+                .iter()
+                .map(|t| {
+                    json!({
+                        "type": "function",
+                        "function": {
+                            "name": t.name,
+                            "description": t.description,
+                            "parameters": t.input_schema,
+                        }
+                    })
+                })
+                .collect();
+            body["tools"] = json!(tools);
         }
         body
     }
 
     fn build_anthropic_body(req: &StreamRequest) -> Value {
-        let msgs: Vec<Value> = req.messages.iter()
-            .filter(|m| !matches!(m.role, Role::System))
-            .map(|m| json!({
-                "role": match m.role { Role::User => "user", Role::Assistant => "assistant", _ => unreachable!() },
-                "content": m.content,
-            })).collect();
+        Self::build_anthropic_body_inner(req, true)
+    }
 
-        let mut body = json!({
-            "model": req.model, "max_tokens": req.max_tokens, "messages": msgs, "stream": true,
-        });
-        if let Some(sys) = &req.system {
-            if !sys.is_empty() {
-                body["system"] = json!([{"type": "text", "text": sys}]);
+    fn build_anthropic_body_no_cache(req: &StreamRequest) -> Value {
+        Self::build_anthropic_body_inner(req, false)
+    }
+
+    fn build_anthropic_body_inner(req: &StreamRequest, with_cache: bool) -> Value {
+        let mut msgs: Vec<Value> = req
+            .messages
+            .iter()
+            .filter(|m| !matches!(m.role, Role::System))
+            .map(|m| {
+                json!({
+                    "role": match m.role {
+                        Role::User => "user",
+                        Role::Assistant => "assistant",
+                        Role::System => unreachable!(),
+                    },
+                    "content": m.content,
+                })
+            })
+            .collect();
+
+        // Third cache breakpoint: tag the last content block of the
+        // second-to-last message so the rolling conversation history
+        // becomes a cached prefix on subsequent turns. The newest
+        // message is the live user turn (uncached by definition); the
+        // one before it is byte-stable across the next call. Skip
+        // when the history is too short — Anthropic's minimum
+        // cacheable prefix is 1024 tokens, so 1–2 messages rarely
+        // qualify and the breakpoint slot is better preserved for
+        // later turns. Anthropic allows up to 4 cache_control markers
+        // per request; this is the third (system + last tool are the
+        // other two).
+        if with_cache && msgs.len() >= 3 {
+            let target_idx = msgs.len() - 2;
+            if let Some(content) = msgs[target_idx]
+                .get_mut("content")
+                .and_then(Value::as_array_mut)
+            {
+                if let Some(last_block) = content.last_mut() {
+                    if let Some(obj) = last_block.as_object_mut() {
+                        obj.insert("cache_control".into(), json!({"type": "ephemeral"}));
+                    }
+                }
             }
         }
-        if !req.tools.is_empty() {
-            body["tools"] = json!(req.tools);
+
+        // Strip provider prefixes so the model name matches what the backend expects.
+        let model = req
+            .model
+            .strip_prefix("oa/")
+            .or_else(|| req.model.strip_prefix("azure/"))
+            .unwrap_or(&req.model);
+
+        let mut body = json!({
+            "model": model,
+            "max_tokens": req.max_tokens,
+            "messages": msgs,
+            "stream": true,
+        });
+
+        if let Some(sys) = &req.system {
+            if !sys.is_empty() {
+                if with_cache {
+                    // Wrap system in a content block with cache_control for prompt caching.
+                    body["system"] = json!([{
+                        "type": "text",
+                        "text": sys,
+                        "cache_control": {"type": "ephemeral"}
+                    }]);
+                } else {
+                    body["system"] = json!([{
+                        "type": "text",
+                        "text": sys,
+                    }]);
+                }
+            }
         }
+
+        if let Some(budget) = req.thinking_budget {
+            if budget > 0 {
+                body["thinking"] = json!({"type": "enabled", "budget_tokens": budget});
+            }
+        }
+
+        if !req.tools.is_empty() {
+            let mut tools_json = json!(req.tools);
+            if with_cache {
+                // Add cache_control to the last tool definition so Anthropic
+                // caches the entire tool schema block (doesn't change per turn).
+                if let Some(arr) = tools_json.as_array_mut() {
+                    if let Some(last) = arr.last_mut() {
+                        last["cache_control"] = json!({"type": "ephemeral"});
+                    }
+                }
+            }
+            body["tools"] = tools_json;
+        }
+
         body
     }
 
@@ -404,23 +668,28 @@ impl OpencodeGoProvider {
                         events.push(ProviderEvent::ContentBlockStop);
                         state.active_tool_index = None;
                     }
-                    let usage = v.get("usage").map(|u| Usage {
-                        input_tokens: u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0)
-                            as u32,
-                        output_tokens: u
-                            .get("completion_tokens")
+                    let usage = v.get("usage").map(|u| {
+                        let cached = u
+                            .pointer("/prompt_tokens_details/cached_tokens")
                             .and_then(Value::as_u64)
-                            .unwrap_or(0) as u32,
-                        cache_creation_input_tokens: u
-                            .get("prompt_tokens_details")
-                            .and_then(|d| d.get("cache_creation_tokens"))
-                            .and_then(Value::as_u64)
-                            .map(|n| n as u32),
-                        cache_read_input_tokens: u
-                            .get("prompt_tokens_details")
-                            .and_then(|d| d.get("cached_tokens"))
-                            .and_then(Value::as_u64)
-                            .map(|n| n as u32),
+                            .or_else(|| u.get("prompt_cache_hit_tokens").and_then(Value::as_u64));
+                        let cached_count = cached.unwrap_or(0);
+                        let input = u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0);
+                        let uncached_input = input.saturating_sub(cached_count);
+                        Usage {
+                            input_tokens: uncached_input as u32,
+                            output_tokens: u
+                                .get("completion_tokens")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(0) as u32,
+                            cache_creation_input_tokens: u
+                                .get("prompt_tokens_details")
+                                .and_then(|d| d.get("cache_creation_tokens"))
+                                .and_then(Value::as_u64)
+                                .map(|n| n as u32),
+                            cache_read_input_tokens: cached.map(|v| v as u32),
+                            reasoning_output_tokens: None,
+                        }
                     });
                     if !state.emitted_message_stop {
                         state.emitted_message_stop = true;
@@ -439,14 +708,28 @@ impl OpencodeGoProvider {
             && v.get("usage").is_some()
             && state.seen_message_start
         {
-            let usage = v.get("usage").map(|u| Usage {
-                input_tokens: u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0) as u32,
-                output_tokens: u
-                    .get("completion_tokens")
+            let usage = v.get("usage").map(|u| {
+                let cached = u
+                    .pointer("/prompt_tokens_details/cached_tokens")
                     .and_then(Value::as_u64)
-                    .unwrap_or(0) as u32,
-                cache_creation_input_tokens: None,
-                cache_read_input_tokens: None,
+                    .or_else(|| u.get("prompt_cache_hit_tokens").and_then(Value::as_u64));
+                let cached_count = cached.unwrap_or(0);
+                let input = u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0);
+                let uncached_input = input.saturating_sub(cached_count);
+                Usage {
+                    input_tokens: uncached_input as u32,
+                    output_tokens: u
+                        .get("completion_tokens")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0) as u32,
+                    cache_creation_input_tokens: u
+                        .get("prompt_tokens_details")
+                        .and_then(|d| d.get("cache_creation_tokens"))
+                        .and_then(Value::as_u64)
+                        .map(|n| n as u32),
+                    cache_read_input_tokens: cached.map(|v| v as u32),
+                    reasoning_output_tokens: None,
+                }
             });
             if !state.emitted_message_stop {
                 state.emitted_message_stop = true;
@@ -572,6 +855,7 @@ impl OpencodeGoProvider {
                         .get("cache_read_input_tokens")
                         .and_then(Value::as_u64)
                         .map(|n| n as u32),
+                    reasoning_output_tokens: None,
                 });
                 Ok(Some(ProviderEvent::MessageStop { stop_reason, usage }))
             }
@@ -584,6 +868,44 @@ impl OpencodeGoProvider {
             return url.clone();
         }
         format!("{}/models", self.base_url.trim_end_matches('/'))
+    }
+
+    async fn load_wire_hints(&self) -> HashMap<String, WireFormat> {
+        let url = self.models_list_url();
+        let Ok(resp) = self
+            .client
+            .get(&url)
+            .header("authorization", format!("Bearer {}", self.api_key))
+            .send()
+            .await
+        else {
+            return HashMap::new();
+        };
+        let Ok(v) = resp.json::<Value>().await else {
+            return HashMap::new();
+        };
+        let mut hints = HashMap::new();
+        if let Some(arr) = v.get("data").and_then(Value::as_array) {
+            for m in arr {
+                let Some(raw_id) = m.get("id").and_then(Value::as_str) else {
+                    continue;
+                };
+                let model_id = raw_id
+                    .strip_prefix("opencode-go/")
+                    .unwrap_or(raw_id)
+                    .to_lowercase();
+                let Some(wire_str) = m.get("wire").and_then(Value::as_str) else {
+                    continue;
+                };
+                let format = match wire_str {
+                    "anthropic" => WireFormat::Anthropic,
+                    "alibaba" => WireFormat::Alibaba,
+                    _ => WireFormat::OpenAI,
+                };
+                hints.insert(model_id, format);
+            }
+        }
+        hints
     }
 }
 
@@ -640,26 +962,83 @@ impl Provider for OpencodeGoProvider {
             req.model = rest.to_string();
         }
 
-        let wire_format = detect_wire_format(&req.model);
+        let hints = self.wire_cache.get_or_init(|| {
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(self.load_wire_hints())
+            })
+        });
+        let wire_format = detect_wire_format_with_hints(&req.model, hints);
         let endpoint = format!(
             "{}{}",
             self.base_url.trim_end_matches('/'),
             endpoint_for(wire_format)
         );
+        // For Anthropic wire format, attempt with cache markers first;
+        // if rejected (400 with "cache_control" in error), retry without.
         let body = match wire_format {
-            WireFormat::OpenAI | WireFormat::Alibaba => Self::build_openai_body(&req),
+            WireFormat::OpenAI => Self::build_openai_body(&req),
+            WireFormat::Alibaba => Self::build_alibaba_body(&req),
             WireFormat::Anthropic => Self::build_anthropic_body(&req),
         };
 
-        let resp = self.send_request(&endpoint, &body, wire_format).await?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(Error::Provider(format!(
-                "http {status}: {}",
-                super::redact_key(&text, &self.api_key)
-            )));
-        }
+        let resp = match wire_format {
+            WireFormat::Anthropic | WireFormat::Alibaba => {
+                let resp = self.send_request(&endpoint, &body, wire_format).await?;
+                if resp.status().is_success() {
+                    resp
+                } else {
+                    let status = resp.status();
+                    let text = resp.text().await.unwrap_or_default();
+                    if status.as_u16() == 400 && text.contains("cache_control") {
+                        eprintln!("\x1b[33m[opencode-go] cache_control rejected by server; retrying without cache markers\x1b[0m");
+                        let body = match wire_format {
+                            WireFormat::Anthropic => Self::build_anthropic_body_no_cache(&req),
+                            WireFormat::Alibaba => Self::build_alibaba_body_no_cache(&req),
+                            _ => unreachable!(),
+                        };
+                        let retry = self.send_request(&endpoint, &body, wire_format).await?;
+                        if !retry.status().is_success() {
+                            let status = retry.status();
+                            let text = retry.text().await.unwrap_or_default();
+                            return Err(Error::Provider(format!(
+                                "http {status} (retry without cache also failed): {}",
+                                super::redact_key(&text, &self.api_key)
+                            )));
+                        }
+                        retry
+                    } else {
+                        if status.as_u16() == 429 {
+                            eprintln!(
+                                "\x1b[33m[opencode-go] 429 Too Many Requests ({})\x1b[0m",
+                                req.model
+                            );
+                        }
+                        return Err(Error::Provider(format!(
+                            "http {status}: {}",
+                            super::redact_key(&text, &self.api_key)
+                        )));
+                    }
+                }
+            }
+            WireFormat::OpenAI => {
+                let resp = self.send_request(&endpoint, &body, wire_format).await?;
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let text = resp.text().await.unwrap_or_default();
+                    if status.as_u16() == 429 {
+                        eprintln!(
+                            "\x1b[33m[opencode-go] 429 Too Many Requests ({})\x1b[0m",
+                            req.model
+                        );
+                    }
+                    return Err(Error::Provider(format!(
+                        "http {status}: {}",
+                        super::redact_key(&text, &self.api_key)
+                    )));
+                }
+                resp
+            }
+        };
 
         let byte_stream = resp.bytes_stream();
         let raw_dump = super::RawDump::new(format!("opencodego {}", req.model));
@@ -759,6 +1138,61 @@ mod tests {
     use crate::types::Message;
 
     #[test]
+    fn hints_override_static_lists() {
+        let mut hints = HashMap::new();
+        hints.insert("minimax-m4".to_string(), WireFormat::Anthropic);
+        hints.insert("qwen5-ultra".to_string(), WireFormat::Alibaba);
+        // model ใหม่ที่ไม่อยู่ใน static list — ได้ hint จาก API
+        assert_eq!(
+            detect_wire_format_with_hints("minimax-m4", &hints),
+            WireFormat::Anthropic
+        );
+        assert_eq!(
+            detect_wire_format_with_hints("qwen5-ultra", &hints),
+            WireFormat::Alibaba
+        );
+        // model เก่าที่ไม่อยู่ใน hints — fallback static list
+        assert_eq!(
+            detect_wire_format_with_hints("minimax-m2.7", &HashMap::new()),
+            WireFormat::Anthropic
+        );
+        // unknown → OpenAI
+        assert_eq!(
+            detect_wire_format_with_hints("glm-5.1", &hints),
+            WireFormat::OpenAI
+        );
+    }
+
+    #[tokio::test]
+    async fn load_wire_hints_empty_on_bad_json() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "minimax-m4"}]  // no "wire" field
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = OpencodeGoProvider::new("test-key")
+            .with_list_models_url(format!("{}/v1/models", server.uri()));
+        let hints = provider.load_wire_hints().await;
+        assert!(hints.is_empty());
+        // fallback static list still works when hints are empty
+        assert_eq!(
+            detect_wire_format_with_hints("minimax-m2.7", &hints),
+            WireFormat::Anthropic
+        );
+        assert_eq!(
+            detect_wire_format_with_hints("glm-5.1", &hints),
+            WireFormat::OpenAI
+        );
+    }
+
+    #[test]
     fn test_detect_wire_format_openai() {
         assert_eq!(detect_wire_format("glm-5.1"), WireFormat::OpenAI);
         assert_eq!(detect_wire_format("kimi-k2.6"), WireFormat::OpenAI);
@@ -770,12 +1204,15 @@ mod tests {
     fn test_detect_wire_format_anthropic() {
         assert_eq!(detect_wire_format("minimax-m2.7"), WireFormat::Anthropic);
         assert_eq!(detect_wire_format("minimax-m2.5"), WireFormat::Anthropic);
+        assert_eq!(detect_wire_format("minimax-m3"), WireFormat::Anthropic);
     }
 
     #[test]
     fn test_detect_wire_format_alibaba() {
         assert_eq!(detect_wire_format("qwen3.6-plus"), WireFormat::Alibaba);
         assert_eq!(detect_wire_format("qwen3.5-plus"), WireFormat::Alibaba);
+        assert_eq!(detect_wire_format("qwen3.7-max"), WireFormat::Alibaba);
+        assert_eq!(detect_wire_format("qwen3.7-plus"), WireFormat::Alibaba);
     }
 
     #[test]
@@ -783,13 +1220,6 @@ mod tests {
         assert_eq!(endpoint_for(WireFormat::OpenAI), "/chat/completions");
         assert_eq!(endpoint_for(WireFormat::Alibaba), "/chat/completions");
         assert_eq!(endpoint_for(WireFormat::Anthropic), "/messages");
-    }
-
-    #[test]
-    fn test_model_uses_reasoning_content() {
-        assert!(model_uses_reasoning_content("deepseek-v4-flash"));
-        assert!(model_uses_reasoning_content("deepseek-v4-pro"));
-        assert!(!model_uses_reasoning_content("glm-5.1"));
     }
 
     #[test]

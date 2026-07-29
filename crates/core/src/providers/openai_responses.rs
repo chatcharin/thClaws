@@ -302,20 +302,45 @@ impl Provider for OpenAIResponsesProvider {
             let mut byte_stream = Box::pin(byte_stream);
             let mut seen_start = false;
             let mut raw = raw_dump;
+            let mut last_activity = std::time::Instant::now();
+            let mut idle_total = std::time::Duration::ZERO;
 
             loop {
+                let since = last_activity.elapsed();
+                let threshold = crate::tool_display::THINKING_HEARTBEAT_AFTER;
+                let wait = if since >= threshold {
+                    crate::tool_display::HEARTBEAT_EVERY
+                } else {
+                    threshold - since
+                }
+                .min(chunk_timeout.saturating_sub(idle_total));
+
                 let maybe_chunk = tokio::time::timeout(
-                    chunk_timeout,
+                    wait,
                     byte_stream.next(),
                 )
-                .await
-                .map_err(|_| Error::Provider(format!(
-                    "stream idle for {}s — provider stopped sending; try again",
-                    chunk_timeout.as_secs()
-                )))?;
-                let Some(chunk) = maybe_chunk else { break };
-                let chunk = chunk.map_err(|e| Error::Provider(format!("stream: {e}")))?;
-                buffer.extend_from_slice(&chunk);
+                .await;
+
+                match maybe_chunk {
+                    Err(_) => {
+                        idle_total += wait;
+                        if idle_total >= chunk_timeout {
+                            Err(Error::Provider(format!(
+                                "stream idle for {}s — provider stopped sending; try again",
+                                chunk_timeout.as_secs()
+                            )))?;
+                        }
+                        yield ProviderEvent::Progress(super::ProgressKind::Thinking);
+                        continue;
+                    }
+                    Ok(maybe) => {
+                        let Some(chunk) = maybe else { break };
+                        let chunk = chunk.map_err(|e| Error::Provider(format!("stream: {e}")))?;
+                        buffer.extend_from_slice(&chunk);
+                        last_activity = std::time::Instant::now();
+                        idle_total = std::time::Duration::ZERO;
+                    }
+                }
 
                 while let Some(boundary) = super::find_bytes(&buffer, b"\n\n") {
                     let event_bytes: Vec<u8> = buffer.drain(..boundary + 2).collect();
@@ -481,11 +506,21 @@ fn parse_response_event(
                     .and_then(Value::as_u64);
                 let cached_count = cached.unwrap_or(0);
                 let uncached_input = total_input.saturating_sub(cached_count);
+                // dev-plan/24: o1/o3 hidden reasoning tokens are
+                // surfaced at output_tokens_details.reasoning_tokens.
+                // OpenAI counts them INSIDE the total output_tokens
+                // already, so consumers compute cost by either pricing
+                // them at a distinct reasoning_per_mtok rate or
+                // accepting fold-into-output. Pass through verbatim.
+                let reasoning = u
+                    .pointer("/output_tokens_details/reasoning_tokens")
+                    .and_then(Value::as_u64);
                 Usage {
                     input_tokens: uncached_input as u32,
                     output_tokens: output as u32,
                     cache_creation_input_tokens: None,
                     cache_read_input_tokens: cached.map(|v| v as u32),
+                    reasoning_output_tokens: reasoning.map(|v| v as u32),
                 }
             });
             let stop_reason = v
