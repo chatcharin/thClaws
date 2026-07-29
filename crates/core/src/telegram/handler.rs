@@ -35,9 +35,12 @@ pub trait MessageHandler: Send + Sync {
 
 /// Format a user for display.
 pub fn format_user(user: &User) -> String {
-    if !user.username.is_empty() {
-        format!("@{}", user.username)
-    } else if let Some(ref last_name) = user.last_name {
+    if let Some(ref username) = user.username {
+        if !username.is_empty() {
+            return format!("@{}", username);
+        }
+    }
+    if let Some(ref last_name) = user.last_name {
         format!("{} {}", user.first_name, last_name)
     } else {
         user.first_name.clone()

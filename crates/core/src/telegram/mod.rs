@@ -31,6 +31,8 @@ pub mod channel;
 pub mod client;
 pub mod config;
 pub mod filter;
+/// Message handler trait for dispatching Telegram events.
+pub mod handler;
 /// Standalone agent loop for `thclaws --telegram` (no GUI feature). Not
 /// gui-gated — it builds its own agent instead of the gui-only worker.
 pub mod headless;

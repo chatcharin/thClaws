@@ -127,7 +127,6 @@ pub mod sso;
 pub mod subagent;
 pub mod telegram;
 pub mod team;
-pub mod telegram;
 #[cfg(feature = "kms_search_index")]
 pub mod thai;
 pub mod theme;
